@@ -255,7 +255,7 @@ export class StackmailClient {
     });
     const data = await res.json().catch(() => ({})) as Record<string, unknown>;
     if (!res.ok) throw new StackmailError(res.status, String(data['error'] ?? 'payment-info-failed'), data);
-    return data as PaymentInfo;
+    return data as unknown as PaymentInfo;
   }
 
   private async buildAuthHeader(
