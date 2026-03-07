@@ -1,8 +1,8 @@
 {
-  "name": "@stackmail/client",
+  "name": "@stackmail/crypto",
   "version": "0.1.0",
   "private": true,
-  "description": "Stackmail agent client — polling-based, no server required",
+  "description": "Stackmail ECIES encryption for secp256k1 keys",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,9 +10,6 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "lint": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@stackmail/crypto": "*"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

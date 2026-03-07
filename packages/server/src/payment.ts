@@ -1,12 +1,18 @@
-// Payment service — interfaces with StackFlow node for payment verification and forwarding
+/**
+ * Payment service — wraps StackFlow node HTTP API.
+ *
+ * In the new design, the sender generates R and includes hashedSecret in their
+ * StackFlow state update. The server's job is to:
+ *   1. Verify the incoming payment proof (sender → server, locked by hashedSecret)
+ *   2. Create an outgoing payment commitment (server → recipient, same hashedSecret, minus fee)
+ *   3. When recipient reveals R: settle both sides
+ */
 
-import { randomBytes, createHash } from 'node:crypto';
-import type { PaymentInfo, Config } from './types.js';
+import type { Config, PendingPayment } from './types.js';
 
 export class PaymentError extends Error {
   readonly statusCode: number;
   readonly reason: string;
-
   constructor(statusCode: number, message: string, reason: string) {
     super(message);
     this.name = 'PaymentError';
@@ -15,158 +21,174 @@ export class PaymentError extends Error {
   }
 }
 
-function generateSecret(): { secret: string; hashedSecret: string } {
-  const secret = `0x${randomBytes(32).toString('hex')}`;
-  const bytes = Buffer.from(secret.slice(2), 'hex');
-  const hashedSecret = `0x${createHash('sha256').update(bytes).digest('hex')}`;
-  return { secret, hashedSecret };
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 }
 
-function generatePaymentId(): string {
-  return `sm-${Date.now().toString(36)}-${randomBytes(6).toString('hex')}`;
-}
-
-export interface PendingPaymentInfo {
-  paymentId: string;
-  secret: string;           // held server-side, revealed to recipient on claim
-  hashedSecret: string;     // sent to sender for their HTLC state update
-  recipientAddr: string;
-  amount: string;
-  fee: string;
-  recipientAmount: string;
-  expiresAt: number;
+export interface VerifiedPayment {
+  hashedSecret: string;
+  incomingAmount: string;
+  senderAddress: string;
 }
 
 export class PaymentService {
   private readonly config: Config;
-  // In-memory store for secrets (paymentId -> secret) — persisted separately in DB
-  private readonly secrets = new Map<string, string>();
 
   constructor(config: Config) {
     this.config = config;
   }
 
   /**
-   * Generate payment parameters for a sender who wants to message a recipient.
-   * Returns the public PaymentInfo (for the sender) and retains the secret server-side.
+   * Verify an x402 indirect payment proof from the sender.
+   * The proof must be a direct StackFlow transfer state update with a hashedSecret.
+   * Server calls its StackFlow node counterparty endpoint to validate and co-sign.
+   *
+   * Returns the hashedSecret (to use for outgoing payment) and verified amount.
    */
-  generatePaymentInfo(recipientAddr: string): { public: PaymentInfo; internal: PendingPaymentInfo } {
-    const { secret, hashedSecret } = generateSecret();
-    const paymentId = generatePaymentId();
-    const amount = this.config.messagePriceSats;
-    const fee = this.config.minFeeSats;
-    const recipientAmount = (BigInt(amount) - BigInt(fee)).toString();
-    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 min
+  async verifyIncomingPayment(proofRaw: string): Promise<VerifiedPayment> {
+    let proof: unknown;
+    try {
+      // Accept base64url or raw JSON
+      try {
+        proof = JSON.parse(Buffer.from(proofRaw, 'base64url').toString('utf-8'));
+      } catch {
+        proof = JSON.parse(proofRaw);
+      }
+    } catch {
+      throw new PaymentError(400, 'invalid payment header encoding', 'invalid-proof-encoding');
+    }
 
-    this.secrets.set(paymentId, secret);
-
-    const internal: PendingPaymentInfo = {
-      paymentId,
-      secret,
-      hashedSecret,
-      recipientAddr,
-      amount,
-      fee,
-      recipientAmount,
-      expiresAt,
-    };
-
-    const publicInfo: PaymentInfo = {
-      paymentId,
-      hashedSecret,
-      amount,
-      fee,
-      recipientAmount,
-      stackflowNodeUrl: this.config.stackflowNodeUrl,
-      serverAddress: this.config.serverStxAddress,
-      expiresAt,
-    };
-
-    return { public: publicInfo, internal };
-  }
-
-  /**
-   * Verify an incoming x402 payment proof by calling the StackFlow node.
-   * Returns the paymentId extracted from the proof.
-   */
-  async verifyIncomingPayment(proof: unknown): Promise<{ paymentId: string; amount: string }> {
-    // The proof is an indirect-mode x402 payment: { mode: 'indirect', paymentId, expectedAmount, ... }
     if (!isRecord(proof)) {
-      throw new PaymentError(400, 'invalid payment proof', 'invalid-proof');
+      throw new PaymentError(400, 'payment proof must be a JSON object', 'invalid-proof');
     }
 
-    if (proof['mode'] !== 'indirect') {
-      throw new PaymentError(400, 'only indirect payment mode is supported', 'unsupported-mode');
+    const hashedSecret = proof['hashedSecret'];
+    if (typeof hashedSecret !== 'string' || !hashedSecret) {
+      throw new PaymentError(400, 'payment proof missing hashedSecret', 'missing-hashed-secret');
     }
 
-    const paymentId = proof['paymentId'];
-    if (typeof paymentId !== 'string' || !paymentId) {
-      throw new PaymentError(400, 'paymentId is required', 'missing-payment-id');
+    const forPrincipal = proof['forPrincipal'] ?? proof['actor'];
+    if (typeof forPrincipal !== 'string') {
+      throw new PaymentError(400, 'payment proof missing forPrincipal', 'invalid-proof');
     }
 
-    // Poll StackFlow node for the forwarding payment record
-    const sfUrl = `${this.config.stackflowNodeUrl}/forwarding/payments?paymentId=${encodeURIComponent(paymentId)}`;
+    // Verify by submitting to our StackFlow node counterparty endpoint.
+    // The node checks the sender's signature, validates balances, and co-signs.
     let sfResponse: Record<string, unknown>;
     try {
-      const res = await fetch(sfUrl, { signal: AbortSignal.timeout(10_000) });
+      const res = await fetch(`${this.config.stackflowNodeUrl}/counterparty/transfer`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(proof),
+        signal: AbortSignal.timeout(10_000),
+      });
+
       if (!res.ok) {
-        throw new PaymentError(402, 'payment not found', 'payment-not-found');
+        const body = await res.json().catch(() => ({})) as Record<string, unknown>;
+        throw new PaymentError(402, `payment verification failed: ${body['reason'] ?? res.status}`, 'payment-rejected');
       }
+
       sfResponse = await res.json() as Record<string, unknown>;
     } catch (err) {
       if (err instanceof PaymentError) throw err;
       throw new PaymentError(502, 'could not reach StackFlow node', 'stackflow-unavailable');
     }
 
-    const status = sfResponse['status'];
-    if (status !== 'completed') {
-      throw new PaymentError(402, `payment not completed: ${status}`, 'payment-pending');
+    if (!sfResponse['ok'] && sfResponse['mySignature'] === undefined) {
+      throw new PaymentError(402, 'StackFlow node rejected payment', 'payment-rejected');
     }
 
-    const incomingAmount = sfResponse['incomingAmount'];
-    if (typeof incomingAmount !== 'string') {
-      throw new PaymentError(502, 'StackFlow node returned unexpected response', 'invalid-stackflow-response');
-    }
+    // Extract the amount from the proof — this is the sender's transfer amount
+    const amount = proof['amount'] ?? proof['myBalance'];
+    const incomingAmount = typeof amount === 'string' ? amount :
+      typeof amount === 'number' ? String(amount) : this.config.messagePriceSats;
 
-    return { paymentId, amount: incomingAmount };
+    return {
+      hashedSecret: hashedSecret as string,
+      incomingAmount,
+      senderAddress: forPrincipal as string,
+    };
   }
 
   /**
-   * Reveal the secret for a paymentId so the recipient can claim their funds.
-   * Calls POST /forwarding/reveal on the StackFlow node.
+   * Create the server's outgoing payment commitment: server → recipient, locked
+   * by the same hashedSecret, for (incomingAmount - fee).
+   *
+   * Calls the StackFlow node to sign a state update on the server→recipient channel.
+   * Returns a PendingPayment to store alongside the message.
+   *
+   * NOTE: Requires an open StackFlow channel between server and recipient.
+   * If no channel exists, returns null (deferred payment model).
    */
-  async revealSecretForPayment(paymentId: string): Promise<string> {
-    const secret = this.secrets.get(paymentId);
-    if (!secret) {
-      throw new PaymentError(404, 'payment secret not found', 'secret-not-found');
-    }
+  async createOutgoingPayment(args: {
+    hashedSecret: string;
+    incomingAmount: string;
+    recipientAddr: string;
+    contractId: string;
+  }): Promise<PendingPayment | null> {
+    const outgoingAmount = (BigInt(args.incomingAmount) - BigInt(this.config.minFeeSats)).toString();
+    if (BigInt(outgoingAmount) <= 0n) return null;
 
-    const sfUrl = `${this.config.stackflowNodeUrl}/forwarding/reveal`;
+    // Build a transfer payload for server → recipient on the existing channel
+    const transferPayload = {
+      contractId: args.contractId,
+      forPrincipal: this.config.serverStxAddress,
+      withPrincipal: args.recipientAddr,
+      action: 1,
+      amount: outgoingAmount,
+      hashedSecret: args.hashedSecret,
+    };
+
     try {
-      const res = await fetch(sfUrl, {
+      const res = await fetch(`${this.config.stackflowNodeUrl}/counterparty/transfer`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ paymentId, secret }),
+        body: JSON.stringify(transferPayload),
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (!res.ok) {
+        // Non-fatal: no channel open yet. Store null, settle later.
+        console.warn(`outgoing payment creation failed for ${args.recipientAddr}: ${res.status}`);
+        return null;
+      }
+
+      const stateProof = await res.json() as Record<string, unknown>;
+      return {
+        stateProof,
+        amount: outgoingAmount,
+        hashedSecret: args.hashedSecret,
+      };
+    } catch {
+      // Non-fatal: StackFlow node unreachable
+      console.warn('could not create outgoing payment, will store null');
+      return null;
+    }
+  }
+
+  /**
+   * Settle both sides of the payment after the recipient reveals R.
+   * Calls the StackFlow node's forwarding reveal endpoint with the secret.
+   */
+  async settlePayment(args: {
+    paymentId: string;
+    secret: string;
+    hashedSecret: string;
+  }): Promise<void> {
+    try {
+      const res = await fetch(`${this.config.stackflowNodeUrl}/forwarding/reveal`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ paymentId: args.paymentId, secret: args.secret }),
         signal: AbortSignal.timeout(10_000),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({})) as Record<string, unknown>;
-        throw new PaymentError(502, `StackFlow reveal failed: ${body['reason'] ?? res.status}`, 'reveal-failed');
+        console.error('payment settlement failed', args.paymentId, body);
       }
     } catch (err) {
-      if (err instanceof PaymentError) throw err;
-      throw new PaymentError(502, 'could not reach StackFlow node', 'stackflow-unavailable');
+      // Non-fatal — can retry
+      console.error('payment settlement error', args.paymentId, err);
     }
-
-    return secret;
   }
-
-  /** Load an in-memory secret back (e.g. after restart from DB) */
-  restoreSecret(paymentId: string, secret: string): void {
-    this.secrets.set(paymentId, secret);
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }

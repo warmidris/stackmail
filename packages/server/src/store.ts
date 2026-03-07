@@ -1,33 +1,49 @@
-// Message store interface + SQLite implementation
+import type {
+  StoredMessage,
+  InboxEntry,
+  MailMessage,
+  InboxQuery,
+  PendingPayment,
+  EncryptedMail,
+} from './types.js';
 
-import type { PendingMessage, InboxEntry, MailMessage, InboxQuery } from './types.js';
+// ─── Interface ───────────────────────────────────────────────────────────────
 
 export interface MessageStore {
   init(): Promise<void>;
-  savePendingMessage(msg: PendingMessage): Promise<void>;
-  getPendingMessage(id: string): Promise<PendingMessage | null>;
-  getInbox(addr: string, query: InboxQuery): Promise<InboxEntry[]>;
-  claimMessage(id: string, addr: string): Promise<MailMessage>;
-  getClaimedMessage(id: string, addr: string): Promise<MailMessage | null>;
-  markPaymentSettled(paymentId: string): Promise<void>;
-  // Payment info lifecycle
+
+  // Recipient public key registry — populated from auth signatures
+  savePublicKey(stxAddress: string, compressedPubkeyHex: string): Promise<void>;
+  getPublicKey(stxAddress: string): Promise<string | null>;
+
+  // Payment info lifecycle (single-use, expires)
   savePendingPaymentInfo(info: {
     paymentId: string;
     hashedSecret: string;
+    secret: string;         // server holds R server-side until recipient claims
     recipientAddr: string;
     amount: string;
     fee: string;
     expiresAt: number;
   }): Promise<void>;
-  getPendingPaymentInfo(paymentId: string): Promise<{
-    paymentId: string;
+  consumePendingPaymentInfo(paymentId: string): Promise<{
     hashedSecret: string;
+    secret: string;
     recipientAddr: string;
     amount: string;
     fee: string;
-    expiresAt: number;
   } | null>;
+
+  // Messages
+  saveMessage(msg: StoredMessage): Promise<void>;
+  getInbox(addr: string, query: InboxQuery): Promise<InboxEntry[]>;
+  getMessage(id: string, recipientAddr: string): Promise<StoredMessage | null>;
+  claimMessage(id: string, recipientAddr: string): Promise<MailMessage>;
+  getClaimedMessage(id: string, recipientAddr: string): Promise<MailMessage | null>;
+  markPaymentSettled(paymentId: string): Promise<void>;
 }
+
+// ─── SQLite implementation ────────────────────────────────────────────────────
 
 export class SqliteMessageStore implements MessageStore {
   private db: import('better-sqlite3').Database | null = null;
@@ -43,45 +59,59 @@ export class SqliteMessageStore implements MessageStore {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('foreign_keys = ON');
-    this.runMigrations();
+    this.migrate();
   }
 
-  private runMigrations(): void {
+  private migrate(): void {
     const db = this.assertDb();
     db.exec(`
       CREATE TABLE IF NOT EXISTS meta (
-        key TEXT PRIMARY KEY,
+        key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
 
-      CREATE TABLE IF NOT EXISTS pending_payment_info (
-        payment_id TEXT PRIMARY KEY,
-        hashed_secret TEXT NOT NULL,
-        recipient_addr TEXT NOT NULL,
-        amount TEXT NOT NULL,
-        fee TEXT NOT NULL,
-        expires_at INTEGER NOT NULL,
-        created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
+      -- Maps STX address → compressed secp256k1 pubkey (hex).
+      -- Populated when a recipient authenticates (their pubkey is recovered
+      -- from the SIP-018 signature and stored here for senders to use).
+      CREATE TABLE IF NOT EXISTS public_keys (
+        stx_address TEXT PRIMARY KEY,
+        pubkey_hex  TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
       );
-      CREATE INDEX IF NOT EXISTS idx_ppi_recipient ON pending_payment_info (recipient_addr);
+
+      -- Single-use payment parameters generated for each send.
+      -- Consumed (deleted) when the corresponding message is received.
+      CREATE TABLE IF NOT EXISTS pending_payment_info (
+        payment_id    TEXT PRIMARY KEY,
+        hashed_secret TEXT NOT NULL,
+        secret        TEXT NOT NULL,   -- R, held server-side
+        recipient_addr TEXT NOT NULL,
+        amount        TEXT NOT NULL,
+        fee           TEXT NOT NULL,
+        expires_at    INTEGER NOT NULL,
+        created_at    INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
+      );
       CREATE INDEX IF NOT EXISTS idx_ppi_expires ON pending_payment_info (expires_at);
 
+      -- Messages: body never returned in listing; only after claim.
       CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        from_addr TEXT NOT NULL,
-        to_addr TEXT NOT NULL,
-        subject TEXT,
-        body TEXT NOT NULL,
-        sent_at INTEGER NOT NULL,
-        amount TEXT NOT NULL,
-        fee TEXT NOT NULL,
-        payment_id TEXT NOT NULL,
-        hashed_secret TEXT NOT NULL,
-        claimed INTEGER NOT NULL DEFAULT 0,
-        claimed_at INTEGER,
-        payment_settled INTEGER NOT NULL DEFAULT 0
+        id                TEXT PRIMARY KEY,
+        from_addr         TEXT NOT NULL,
+        to_addr           TEXT NOT NULL,
+        sent_at           INTEGER NOT NULL,
+        amount            TEXT NOT NULL,
+        fee               TEXT NOT NULL,
+        payment_id        TEXT NOT NULL,
+        hashed_secret     TEXT NOT NULL,
+        -- ECIES-encrypted payload (JSON blob: EncryptedMail)
+        encrypted_payload TEXT NOT NULL,
+        -- Server's signed outgoing StackFlow state update (JSON blob: PendingPayment | null)
+        pending_payment   TEXT,
+        claimed           INTEGER NOT NULL DEFAULT 0,
+        claimed_at        INTEGER,
+        payment_settled   INTEGER NOT NULL DEFAULT 0
       );
-      CREATE INDEX IF NOT EXISTS idx_msg_to ON messages (to_addr, sent_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_msg_inbox ON messages (to_addr, sent_at DESC);
       CREATE INDEX IF NOT EXISTS idx_msg_payment ON messages (payment_id);
     `);
     db.prepare("INSERT OR IGNORE INTO meta VALUES ('version', '1')").run();
@@ -92,68 +122,95 @@ export class SqliteMessageStore implements MessageStore {
     return this.db;
   }
 
+  async savePublicKey(stxAddress: string, compressedPubkeyHex: string): Promise<void> {
+    this.assertDb().prepare(`
+      INSERT INTO public_keys (stx_address, pubkey_hex)
+      VALUES (?, ?)
+      ON CONFLICT (stx_address) DO UPDATE SET pubkey_hex = excluded.pubkey_hex,
+                                              updated_at = unixepoch('now') * 1000
+    `).run(stxAddress, compressedPubkeyHex);
+  }
+
+  async getPublicKey(stxAddress: string): Promise<string | null> {
+    const row = this.assertDb()
+      .prepare('SELECT pubkey_hex FROM public_keys WHERE stx_address = ?')
+      .get(stxAddress) as { pubkey_hex: string } | undefined;
+    return row?.pubkey_hex ?? null;
+  }
+
   async savePendingPaymentInfo(info: {
     paymentId: string;
     hashedSecret: string;
+    secret: string;
     recipientAddr: string;
     amount: string;
     fee: string;
     expiresAt: number;
   }): Promise<void> {
-    const db = this.assertDb();
-    db.prepare(`
+    this.assertDb().prepare(`
       INSERT INTO pending_payment_info
-        (payment_id, hashed_secret, recipient_addr, amount, fee, expires_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(info.paymentId, info.hashedSecret, info.recipientAddr, info.amount, info.fee, info.expiresAt);
+        (payment_id, hashed_secret, secret, recipient_addr, amount, fee, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(info.paymentId, info.hashedSecret, info.secret, info.recipientAddr, info.amount, info.fee, info.expiresAt);
   }
 
-  async getPendingPaymentInfo(paymentId: string): Promise<{
-    paymentId: string;
+  async consumePendingPaymentInfo(paymentId: string): Promise<{
     hashedSecret: string;
+    secret: string;
     recipientAddr: string;
     amount: string;
     fee: string;
-    expiresAt: number;
   } | null> {
     const db = this.assertDb();
-    const row = db.prepare('SELECT * FROM pending_payment_info WHERE payment_id = ?').get(paymentId) as Record<string, unknown> | undefined;
+    const row = db.prepare(`
+      SELECT hashed_secret, secret, recipient_addr, amount, fee, expires_at
+      FROM pending_payment_info WHERE payment_id = ?
+    `).get(paymentId) as Record<string, unknown> | undefined;
+
     if (!row) return null;
+    if ((row.expires_at as number) < Date.now()) {
+      db.prepare('DELETE FROM pending_payment_info WHERE payment_id = ?').run(paymentId);
+      return null;
+    }
+
+    // Single-use: consume it
+    db.prepare('DELETE FROM pending_payment_info WHERE payment_id = ?').run(paymentId);
     return {
-      paymentId: row.payment_id as string,
       hashedSecret: row.hashed_secret as string,
+      secret: row.secret as string,
       recipientAddr: row.recipient_addr as string,
       amount: row.amount as string,
       fee: row.fee as string,
-      expiresAt: row.expires_at as number,
     };
   }
 
-  async savePendingMessage(msg: PendingMessage): Promise<void> {
-    const db = this.assertDb();
-    db.prepare(`
+  async saveMessage(msg: StoredMessage): Promise<void> {
+    this.assertDb().prepare(`
       INSERT INTO messages
-        (id, from_addr, to_addr, subject, body, sent_at, amount, fee, payment_id, hashed_secret, claimed)
+        (id, from_addr, to_addr, sent_at, amount, fee, payment_id, hashed_secret,
+         encrypted_payload, pending_payment, claimed)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-    `).run(msg.id, msg.from, msg.to, msg.subject ?? null, msg.body, msg.sentAt, msg.amount, msg.fee, msg.paymentId, msg.hashedSecret);
-  }
-
-  async getPendingMessage(id: string): Promise<PendingMessage | null> {
-    const db = this.assertDb();
-    const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-    if (!row) return null;
-    return this.rowToPending(row);
+    `).run(
+      msg.id,
+      msg.from,
+      msg.to,
+      msg.sentAt,
+      msg.amount,
+      msg.fee,
+      msg.paymentId,
+      msg.hashedSecret,
+      JSON.stringify(msg.encryptedPayload),
+      msg.pendingPayment ? JSON.stringify(msg.pendingPayment) : null,
+    );
   }
 
   async getInbox(addr: string, query: InboxQuery): Promise<InboxEntry[]> {
-    const db = this.assertDb();
     const limit = Math.min(query.limit ?? 50, 100);
     const before = query.before ?? Date.now() + 1000;
-    const includeClained = query.includeClained ?? false;
+    const claimedClause = query.includeClaimed ? '' : 'AND claimed = 0';
 
-    const claimedClause = includeClained ? '' : 'AND claimed = 0';
-    const rows = db.prepare(`
-      SELECT id, from_addr, subject, sent_at, amount, claimed
+    const rows = this.assertDb().prepare(`
+      SELECT id, from_addr, sent_at, amount, claimed
       FROM messages
       WHERE to_addr = ? AND sent_at < ? ${claimedClause}
       ORDER BY sent_at DESC
@@ -163,73 +220,75 @@ export class SqliteMessageStore implements MessageStore {
     return rows.map(row => ({
       id: row.id as string,
       from: row.from_addr as string,
-      subject: row.subject as string | undefined,
       sentAt: row.sent_at as number,
       amount: row.amount as string,
       claimed: Boolean(row.claimed),
     }));
   }
 
-  async claimMessage(id: string, addr: string): Promise<MailMessage> {
+  async getMessage(id: string, recipientAddr: string): Promise<StoredMessage | null> {
+    const row = this.assertDb()
+      .prepare('SELECT * FROM messages WHERE id = ? AND to_addr = ?')
+      .get(id, recipientAddr) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.rowToStored(row);
+  }
+
+  async claimMessage(id: string, recipientAddr: string): Promise<MailMessage> {
     const db = this.assertDb();
-    const row = db.prepare('SELECT * FROM messages WHERE id = ? AND to_addr = ?').get(id, addr) as Record<string, unknown> | undefined;
+    const row = db.prepare('SELECT * FROM messages WHERE id = ? AND to_addr = ?')
+      .get(id, recipientAddr) as Record<string, unknown> | undefined;
     if (!row) throw new Error('message-not-found');
     if (row.claimed) throw new Error('already-claimed');
 
-    const now = Date.now();
-    db.prepare('UPDATE messages SET claimed = 1, claimed_at = ? WHERE id = ?').run(now, id);
-
-    const pending = this.rowToPending(row);
-    return {
-      id: pending.id,
-      from: pending.from,
-      to: pending.to,
-      subject: pending.subject,
-      body: pending.body,
-      sentAt: pending.sentAt,
-      amount: pending.amount,
-      fee: pending.fee,
-      paymentId: pending.paymentId,
-    };
+    db.prepare('UPDATE messages SET claimed = 1, claimed_at = ? WHERE id = ?').run(Date.now(), id);
+    return this.rowToMail(row);
   }
 
-  async getClaimedMessage(id: string, addr: string): Promise<MailMessage | null> {
-    const db = this.assertDb();
-    const row = db.prepare('SELECT * FROM messages WHERE id = ? AND to_addr = ? AND claimed = 1').get(id, addr) as Record<string, unknown> | undefined;
+  async getClaimedMessage(id: string, recipientAddr: string): Promise<MailMessage | null> {
+    const row = this.assertDb()
+      .prepare('SELECT * FROM messages WHERE id = ? AND to_addr = ? AND claimed = 1')
+      .get(id, recipientAddr) as Record<string, unknown> | undefined;
     if (!row) return null;
-    const pending = this.rowToPending(row);
-    return {
-      id: pending.id,
-      from: pending.from,
-      to: pending.to,
-      subject: pending.subject,
-      body: pending.body,
-      sentAt: pending.sentAt,
-      amount: pending.amount,
-      fee: pending.fee,
-      paymentId: pending.paymentId,
-    };
+    return this.rowToMail(row);
   }
 
   async markPaymentSettled(paymentId: string): Promise<void> {
-    const db = this.assertDb();
-    db.prepare('UPDATE messages SET payment_settled = 1 WHERE payment_id = ?').run(paymentId);
+    this.assertDb()
+      .prepare('UPDATE messages SET payment_settled = 1 WHERE payment_id = ?')
+      .run(paymentId);
   }
 
-  private rowToPending(row: Record<string, unknown>): PendingMessage {
+  private rowToStored(row: Record<string, unknown>): StoredMessage {
     return {
       id: row.id as string,
       from: row.from_addr as string,
       to: row.to_addr as string,
-      subject: row.subject as string | undefined,
-      body: row.body as string,
       sentAt: row.sent_at as number,
       amount: row.amount as string,
       fee: row.fee as string,
       paymentId: row.payment_id as string,
       hashedSecret: row.hashed_secret as string,
+      encryptedPayload: JSON.parse(row.encrypted_payload as string) as EncryptedMail,
+      pendingPayment: row.pending_payment
+        ? JSON.parse(row.pending_payment as string) as PendingPayment
+        : null,
       claimed: Boolean(row.claimed),
       claimedAt: row.claimed_at as number | undefined,
+      paymentSettled: Boolean(row.payment_settled),
+    };
+  }
+
+  private rowToMail(row: Record<string, unknown>): MailMessage {
+    return {
+      id: row.id as string,
+      from: row.from_addr as string,
+      to: row.to_addr as string,
+      sentAt: row.sent_at as number,
+      amount: row.amount as string,
+      fee: row.fee as string,
+      paymentId: row.payment_id as string,
+      encryptedPayload: JSON.parse(row.encrypted_payload as string) as EncryptedMail,
     };
   }
 }
