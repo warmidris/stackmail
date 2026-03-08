@@ -11,34 +11,14 @@ services:
       STACKMAIL_HOST: "0.0.0.0"
       STACKMAIL_PORT: "8800"
       STACKMAIL_DB_FILE: "/data/stackmail.db"
-      STACKMAIL_STACKFLOW_NODE_URL: "http://stackflow-node:8787"
       STACKMAIL_SERVER_STX_ADDRESS: "${STACKMAIL_SERVER_STX_ADDRESS}"
+      STACKMAIL_SERVER_PRIVATE_KEY: "${STACKMAIL_SERVER_PRIVATE_KEY}"
       STACKMAIL_SF_CONTRACT_ID: "${STACKMAIL_SF_CONTRACT_ID}"
+      STACKMAIL_STACKS_NETWORK: "${STACKMAIL_STACKS_NETWORK:-mainnet}"
       STACKMAIL_MESSAGE_PRICE_SATS: "${STACKMAIL_MESSAGE_PRICE_SATS:-1000}"
       STACKMAIL_MIN_FEE_SATS: "${STACKMAIL_MIN_FEE_SATS:-100}"
-    depends_on:
-      - stackflow-node
-    restart: unless-stopped
-
-  stackflow-node:
-    # Use the stackflow-node image — build separately from obycode/stackflow
-    # docker build -t stackflow-node -f server/Dockerfile .
-    image: stackflow-node:latest
-    expose:
-      - "8787"
-    volumes:
-      - stackflow_data:/data
-    environment:
-      STACKFLOW_NODE_HOST: "0.0.0.0"
-      STACKFLOW_NODE_PORT: "8787"
-      STACKFLOW_NODE_DB_FILE: "/data/stackflow-node.db"
-      STACKFLOW_NODE_COUNTERPARTY_KEY: "${STACKFLOW_NODE_COUNTERPARTY_KEY}"
-      STACKFLOW_NODE_FORWARDING_ENABLED: "true"
-      STACKFLOW_NODE_FORWARDING_MIN_FEE: "${STACKMAIL_MIN_FEE_SATS:-100}"
-      STACKS_NETWORK: "${STACKS_NETWORK:-mainnet}"
-      STACKS_API_URL: "${STACKS_API_URL:-https://api.hiro.so}"
+      STACKMAIL_MAX_PENDING_PER_SENDER: "${STACKMAIL_MAX_PENDING_PER_SENDER:-5}"
     restart: unless-stopped
 
 volumes:
   stackmail_data:
-  stackflow_data:

@@ -1,0 +1,35 @@
+app = "stackmail"
+primary_region = "ord"
+
+[build]
+
+[env]
+  STACKMAIL_HOST = "0.0.0.0"
+  STACKMAIL_PORT = "8800"
+  STACKMAIL_DB_FILE = "/data/stackmail.db"
+  STACKMAIL_STACKS_NETWORK = "mainnet"
+  STACKMAIL_MESSAGE_PRICE_SATS = "1000"
+  STACKMAIL_MIN_FEE_SATS = "100"
+  STACKMAIL_MAX_PENDING_PER_SENDER = "5"
+
+[[mounts]]
+  source = "stackmail_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8800
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period = "5s"
+    interval = "30s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

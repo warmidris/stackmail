@@ -144,6 +144,24 @@ export class ReservoirService {
       throw new ReservoirError(400, 'invalid payment header encoding', 'invalid-proof-encoding');
     }
 
+    // Dev/bypass mode: when no server key is configured, accept a simple proof
+    // format { hashedSecret, forPrincipal|actor, amount } without SIP-018 verification.
+    if (!this.serverPrivateKey) {
+      const hashedSecret = typeof proof['hashedSecret'] === 'string' ? proof['hashedSecret'] : null;
+      if (!hashedSecret) {
+        throw new ReservoirError(400, 'payment proof missing hashedSecret', 'missing-hashed-secret');
+      }
+      const senderAddress = (
+        typeof proof['forPrincipal'] === 'string' ? proof['forPrincipal'] :
+        typeof proof['actor'] === 'string' ? proof['actor'] : 'unknown'
+      );
+      const incomingAmount = (
+        typeof proof['amount'] === 'string' ? proof['amount'] :
+        this.messagePriceSats.toString()
+      );
+      return { hashedSecret, incomingAmount, senderAddress };
+    }
+
     // Extract required fields
     const contractId = typeof proof['contractId'] === 'string' ? proof['contractId'] : this.contractId;
     const pipeKeyRaw = proof['pipeKey'];
