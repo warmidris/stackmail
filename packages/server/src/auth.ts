@@ -54,7 +54,7 @@ export interface AuthResult {
  * address = c32check_encode(version, hash160(pubkey))
  * hash160 = RIPEMD160(SHA256(pubkey))
  */
-function pubkeyToStxAddress(pubkeyHex: string, testnet = false): string {
+export function pubkeyToStxAddress(pubkeyHex: string, testnet = false): string {
   const pubkey = Buffer.from(pubkeyHex.replace(/^0x/, ''), 'hex');
 
   // hash160: SHA256 then RIPEMD160
@@ -109,7 +109,7 @@ function c32checkEncode(version: number, data: Buffer): string {
 
   const full = Buffer.concat([data, checksum]);
   const encoded = c32encode(full);
-  return `SP${C32_CHARS[version & 0x1f]}${encoded}`;
+  return `S${C32_CHARS[version & 0x1f]}${encoded}`;
 }
 
 /**
