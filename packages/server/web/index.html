@@ -1184,11 +1184,8 @@ async function openMailbox() {
     const sfContractArg = '0x' + bytesToHex(serializeClarityValue({ type: 'principal', value: SF_CONTRACT }));
     const tokenArg      = '0x' + bytesToHex(serializeClarityValue({ type: 'none' }));
 
-    const [reservoirAddr, reservoirName] = RESERVOIR.split('.');
-
     const resp = await walletProvider.request('stx_callContract', {
-      contractAddress: reservoirAddr,
-      contractName:    reservoirName,
+      contract:        RESERVOIR,
       functionName:    'create-tap-with-borrowed-liquidity',
       functionArgs:    [sfContractArg, tokenArg],
       network:         serverStatus.network ?? 'mainnet',
