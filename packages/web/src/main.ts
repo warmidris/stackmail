@@ -28,8 +28,6 @@ import type { ClarityValue } from '@stacks/transactions';
 
 const SF_CONTRACT = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow';
 const RESERVOIR   = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir';
-const TOKEN       = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token';
-const TOKEN_NAME  = 'sm-test-token'; // asset name inside the SIP-010 contract
 const CHAIN_ID    = 1; // mainnet; updated from /status if available
 const OPEN_TAP_AMOUNT = 10_000n; // outbound liquidity from the user (sats)
 const OPEN_TAP_NONCE  = 0n;
