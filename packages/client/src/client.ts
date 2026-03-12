@@ -49,6 +49,8 @@ export class StackmailError extends Error {
 
 export class StackmailClient {
   private readonly config: ClientConfig;
+  private inboxSessionToken: string | null = null;
+  private inboxSessionExpiresAt = 0;
 
   constructor(config: ClientConfig) {
     this.config = config;
@@ -101,6 +103,7 @@ export class StackmailClient {
       },
       body: JSON.stringify({
         from: this.config.address,
+        fromPublicKey: this.config.publicKey,
         encryptedPayload,
       }),
       signal: AbortSignal.timeout(30_000),
@@ -124,9 +127,10 @@ export class StackmailClient {
     if (opts.includeClaimed) url.searchParams.set('claimed', 'true');
 
     const res = await fetch(url.toString(), {
-      headers: { 'x-stackmail-auth': await this.buildAuthHeader('get-inbox') },
+      headers: await this.buildInboxHeaders('get-inbox'),
       signal: AbortSignal.timeout(15_000),
     });
+    this.captureInboxSession(res);
 
     const data = await res.json().catch(() => ({})) as Record<string, unknown>;
     if (!res.ok) throw new StackmailError(res.status, String(data['error'] ?? 'inbox-failed'), data);
@@ -179,11 +183,12 @@ export class StackmailClient {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-stackmail-auth': await this.buildAuthHeader('claim-message', messageId),
+        ...(await this.buildInboxHeaders('claim-message', messageId)),
       },
       body: JSON.stringify({ secret: secretHex }),
       signal: AbortSignal.timeout(15_000),
     });
+    this.captureInboxSession(res);
 
     const data = await res.json().catch(() => ({})) as Record<string, unknown>;
     if (!res.ok) throw new StackmailError(res.status, String(data['error'] ?? 'claim-failed'), data);
@@ -258,9 +263,10 @@ export class StackmailClient {
     hashedSecret: string;
   }> {
     const res = await fetch(`${this.config.serverUrl}/inbox/${encodeURIComponent(messageId)}/preview`, {
-      headers: { 'x-stackmail-auth': await this.buildAuthHeader('get-message', messageId) },
+      headers: await this.buildInboxHeaders('get-message', messageId),
       signal: AbortSignal.timeout(15_000),
     });
+    this.captureInboxSession(res);
 
     const data = await res.json().catch(() => ({})) as Record<string, unknown>;
     if (!res.ok) throw new StackmailError(res.status, String(data['error'] ?? 'preview-failed'), data);
@@ -328,5 +334,25 @@ export class StackmailClient {
     const message = JSON.stringify(payload);
     const signature = await this.config.signer(message);
     return Buffer.from(JSON.stringify({ pubkey: this.config.publicKey, payload, signature })).toString('base64');
+  }
+
+  private async buildInboxHeaders(
+    action: 'get-inbox' | 'claim-message' | 'get-message',
+    messageId?: string,
+  ): Promise<Record<string, string>> {
+    if (this.inboxSessionToken && Date.now() < this.inboxSessionExpiresAt) {
+      return { 'x-stackmail-session': this.inboxSessionToken };
+    }
+    return { 'x-stackmail-auth': await this.buildAuthHeader(action, messageId) };
+  }
+
+  private captureInboxSession(res: Response): void {
+    const token = res.headers.get('x-stackmail-session');
+    const expiresAtRaw = res.headers.get('x-stackmail-session-expires-at');
+    const expiresAt = expiresAtRaw ? Number(expiresAtRaw) : 0;
+    if (token && Number.isFinite(expiresAt) && expiresAt > Date.now()) {
+      this.inboxSessionToken = token;
+      this.inboxSessionExpiresAt = expiresAt;
+    }
   }
 }

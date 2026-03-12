@@ -35,6 +35,8 @@ export interface DecryptedMessage {
   /**
    * Off-chain dispute artifact for this claim.
    * Save this (especially secret + pendingPayment) so you can prove HTLC release later.
+   * This covers the receive side only; callers still need to persist the latest
+   * signed state for their own taps after sends.
    */
   claimProof: ClaimProofRecord;
 }
@@ -133,6 +135,8 @@ export interface ClientConfig {
   /**
    * Optional hook to persist claim proofs (secret + pending payment + verification result)
    * for future dispute handling.
+   * Agents should treat this as required in production and also persist their
+   * own latest signed sender-side tap states separately.
    */
   saveClaimProof?: (proof: ClaimProofRecord) => Promise<void> | void;
 }

@@ -47,6 +47,14 @@ interface PipeRow {
   last_counterparty_signature: string | null;
 }
 
+interface OnChainPipeState {
+  balance1: bigint;
+  balance2: bigint;
+  pending1: bigint;
+  pending2: bigint;
+  nonce: bigint;
+}
+
 function serializePrincipalForSort(principal: string): Buffer {
   return Buffer.from(serializeCVBytes(principalCV(principal)));
 }
@@ -365,9 +373,77 @@ export class ReservoirService {
     actor: string,
     pipeKey: { 'principal-1': string; 'principal-2': string; token?: string | null },
   ): Promise<boolean> {
+    return (await this.getOnChainPipeState(actor, pipeKey)) != null;
+  }
+
+  private parsePipeReadOnlyResult(result: string): OnChainPipeState | null {
+    try {
+      const cv = hexToCV(result);
+      let value: ClarityValue = cv;
+      if (value.type === 'ok') {
+        value = (value as unknown as { value: ClarityValue }).value;
+      } else if (value.type === 'err') {
+        return null;
+      }
+      if (value.type === 'none') return null;
+      if (value.type === 'some') {
+        value = (value as unknown as { value: ClarityValue }).value;
+      }
+      if (value.type !== 'tuple') return null;
+      const tuple = (value as unknown as { value: Record<string, ClarityValue> }).value;
+
+      const readUint = (field: string): bigint | null => {
+        const item = tuple[field];
+        if (!item) return null;
+        return extractUintFromCv(item);
+      };
+      const readPendingAmount = (field: string): bigint => {
+        const item = tuple[field];
+        if (!item) return 0n;
+        if (item.type === 'none') return 0n;
+        if (item.type !== 'some') return 0n;
+        const inner = (item as unknown as { value: ClarityValue }).value;
+        if (inner.type !== 'tuple') return 0n;
+        const amount = extractUintFromCv((inner as unknown as { value: Record<string, ClarityValue> }).value.amount);
+        return amount ?? 0n;
+      };
+
+      const balance1 = readUint('balance-1');
+      const balance2 = readUint('balance-2');
+      const nonce = readUint('nonce');
+      if (balance1 == null || balance2 == null || nonce == null) return null;
+
+      return {
+        balance1,
+        balance2,
+        pending1: readPendingAmount('pending-1'),
+        pending2: readPendingAmount('pending-2'),
+        nonce,
+      };
+    } catch {
+      const b1m = result.match(/balance-1 u(\d+)/);
+      const b2m = result.match(/balance-2 u(\d+)/);
+      const p1m = result.match(/pending-1 \((?:some )?\(tuple \(amount u(\d+)\)/);
+      const p2m = result.match(/pending-2 \((?:some )?\(tuple \(amount u(\d+)\)/);
+      const ncm = result.match(/nonce u(\d+)/);
+      if (!b1m || !b2m || !ncm) return null;
+      return {
+        balance1: BigInt(b1m[1]),
+        balance2: BigInt(b2m[1]),
+        pending1: p1m ? BigInt(p1m[1]) : 0n,
+        pending2: p2m ? BigInt(p2m[1]) : 0n,
+        nonce: BigInt(ncm[1]),
+      };
+    }
+  }
+
+  private async getOnChainPipeState(
+    actor: string,
+    pipeKey: { 'principal-1': string; 'principal-2': string; token?: string | null },
+  ): Promise<OnChainPipeState | null> {
     try {
       const [contractAddr, contractName] = this.contractId.split('.');
-      if (!contractAddr || !contractName) return false;
+      if (!contractAddr || !contractName) return null;
 
       const tokenCV = pipeKey.token != null ? someCV(principalCV(pipeKey.token)) : noneCV();
       const withCV = principalCV(this.serverAddress);
@@ -385,14 +461,12 @@ export class ReservoirService {
         }),
       });
 
-      if (!response.ok) return false;
+      if (!response.ok) return null;
       const payload = await response.json() as { okay?: boolean; result?: string };
-      if (!payload.okay || typeof payload.result !== 'string') return false;
-
-      const cv = hexToCV(payload.result);
-      return cv.type === 'some';
+      if (!payload.okay || typeof payload.result !== 'string') return null;
+      return this.parsePipeReadOnlyResult(payload.result);
     } catch {
-      return false;
+      return null;
     }
   }
 
@@ -548,10 +622,20 @@ export class ReservoirService {
     let incomingAmount: bigint;
     if (existing) {
       const existingServerBalance = BigInt(existing.server_balance);
+      const existingSenderBalance = BigInt(existing.counterparty_balance);
       const existingNonce = BigInt(existing.nonce);
+      const existingTotal = existingServerBalance + existingSenderBalance;
+      const incomingTotal = serverNewBalance + senderNewBalance;
 
       if (incomingNonce !== existingNonce + 1n) {
         throw new ReservoirError(402, `nonce must be ${existingNonce + 1n}, got ${incomingNonce}`, 'invalid-nonce');
+      }
+      if (incomingTotal !== existingTotal) {
+        throw new ReservoirError(
+          402,
+          `payment proof total ${incomingTotal} does not match tracked total ${existingTotal}`,
+          'invalid-total-balance',
+        );
       }
       if (serverNewBalance <= existingServerBalance) {
         throw new ReservoirError(402, 'server balance did not increase', 'balance-not-increased');
@@ -559,13 +643,39 @@ export class ReservoirService {
 
       incomingAmount = serverNewBalance - existingServerBalance;
     } else {
-      // No DB record — verify a tap exists on-chain before accepting first payment.
-      const tapExists = await this.checkOnChainPipeExists(actor, pipeKey);
-      if (!tapExists) {
+      // No DB record — derive the starting entitlement balances from on-chain pipe state.
+      const onChainPipe = await this.getOnChainPipeState(actor, pipeKey);
+      if (!onChainPipe) {
         throw new ReservoirError(402, `no tap found for sender ${actor}`, 'no-tap');
       }
-      // Tap confirmed on-chain; accept this as the first payment on this pipe.
-      incomingAmount = serverNewBalance;
+      const serverIsPrincipal1 = pipeKey['principal-1'] === this.serverAddress;
+      const initialServerBalance = serverIsPrincipal1
+        ? onChainPipe.balance1 + onChainPipe.pending1
+        : onChainPipe.balance2 + onChainPipe.pending2;
+      const initialSenderBalance = serverIsPrincipal1
+        ? onChainPipe.balance2 + onChainPipe.pending2
+        : onChainPipe.balance1 + onChainPipe.pending1;
+      const initialTotal = initialServerBalance + initialSenderBalance;
+      const proofTotal = serverNewBalance + senderNewBalance;
+
+      if (incomingNonce <= onChainPipe.nonce) {
+        throw new ReservoirError(
+          402,
+          `nonce must be greater than on-chain nonce ${onChainPipe.nonce}, got ${incomingNonce}`,
+          'invalid-nonce',
+        );
+      }
+      if (proofTotal !== initialTotal) {
+        throw new ReservoirError(
+          402,
+          `payment proof total ${proofTotal} does not match on-chain total ${initialTotal}`,
+          'invalid-total-balance',
+        );
+      }
+      if (serverNewBalance <= initialServerBalance) {
+        throw new ReservoirError(402, 'server balance did not increase', 'balance-not-increased');
+      }
+      incomingAmount = serverNewBalance - initialServerBalance;
     }
 
     if (incomingAmount < this.messagePriceSats) {
@@ -832,6 +942,24 @@ export class ReservoirService {
       this.chainId,
     );
     const borrowFee = await this.fetchBorrowFeeFromReservoir(borrowAmount);
+
+    // Persist the initial post-open state so the server can track the tap immediately.
+    this.upsertPipe(
+      this.buildPipeId(this.contractId, pipeKey),
+      this.contractId,
+      pipeKey,
+      reservoirBalance.toString(),
+      myBalance.toString(),
+      borrowNonce.toString(),
+      {
+        action: '2',
+        actor: reservoirPrincipal,
+        hashedSecret: null,
+        validAfter: null,
+        serverSignature: reservoirSignature,
+        counterpartySignature: args.mySignature,
+      },
+    );
 
     return {
       borrowFee: borrowFee.toString(),

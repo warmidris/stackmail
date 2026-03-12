@@ -12,6 +12,10 @@ import type {
 export interface MessageStore {
   init(): Promise<void>;
 
+  // Recipient public key registry
+  savePublicKey(addr: string, pubkeyHex: string): Promise<void>;
+  getPublicKey(addr: string): Promise<string | null>;
+
   // Payment info lifecycle (single-use, expires)
   savePendingPaymentInfo(info: {
     paymentId: string;
@@ -40,6 +44,8 @@ export interface MessageStore {
 
   /** Count unclaimed messages from a given sender to a given recipient */
   countPendingFromSender(fromAddr: string, toAddr: string): Promise<number>;
+  /** Count all unclaimed messages currently waiting for a recipient */
+  countPendingToRecipient(toAddr: string): Promise<number>;
 }
 
 // ─── SQLite implementation ────────────────────────────────────────────────────
@@ -103,6 +109,12 @@ export class SqliteMessageStore implements MessageStore {
       );
       CREATE INDEX IF NOT EXISTS idx_msg_inbox ON messages (to_addr, sent_at DESC);
       CREATE INDEX IF NOT EXISTS idx_msg_payment ON messages (payment_id);
+
+      CREATE TABLE IF NOT EXISTS public_keys (
+        stx_address TEXT PRIMARY KEY,
+        pubkey_hex  TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
+      );
     `);
     db.prepare("INSERT OR IGNORE INTO meta VALUES ('version', '1')").run();
   }
@@ -126,6 +138,23 @@ export class SqliteMessageStore implements MessageStore {
         (payment_id, hashed_secret, secret, recipient_addr, amount, fee, expires_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(info.paymentId, info.hashedSecret, info.secret, info.recipientAddr, info.amount, info.fee, info.expiresAt);
+  }
+
+  async savePublicKey(addr: string, pubkeyHex: string): Promise<void> {
+    this.assertDb().prepare(`
+      INSERT INTO public_keys (stx_address, pubkey_hex, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(stx_address) DO UPDATE SET
+        pubkey_hex = excluded.pubkey_hex,
+        updated_at = excluded.updated_at
+    `).run(addr, pubkeyHex, Date.now());
+  }
+
+  async getPublicKey(addr: string): Promise<string | null> {
+    const row = this.assertDb()
+      .prepare('SELECT pubkey_hex FROM public_keys WHERE stx_address = ?')
+      .get(addr) as { pubkey_hex: string } | undefined;
+    return row?.pubkey_hex ?? null;
   }
 
   async consumePendingPaymentInfo(paymentId: string): Promise<{
@@ -237,6 +266,13 @@ export class SqliteMessageStore implements MessageStore {
     const row = this.assertDb()
       .prepare('SELECT COUNT(*) as cnt FROM messages WHERE from_addr = ? AND to_addr = ? AND claimed = 0')
       .get(fromAddr, toAddr) as { cnt: number };
+    return row?.cnt ?? 0;
+  }
+
+  async countPendingToRecipient(toAddr: string): Promise<number> {
+    const row = this.assertDb()
+      .prepare('SELECT COUNT(*) as cnt FROM messages WHERE to_addr = ? AND claimed = 0')
+      .get(toAddr) as { cnt: number };
     return row?.cnt ?? 0;
   }
 

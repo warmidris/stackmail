@@ -24,7 +24,7 @@
  * pubkeys from the blockchain (Stacks transaction history via Hiro API).
  */
 
-import { createHash, createVerify } from 'node:crypto';
+import { createHash, createHmac, createVerify, timingSafeEqual } from 'node:crypto';
 import type { Config } from './types.js';
 import type { MessageStore } from './store.js';
 import { sip018Verify, type TypedMessage } from './sip018.js';
@@ -53,6 +53,11 @@ export interface AuthPayload {
 export interface AuthResult {
   payload: AuthPayload;
   pubkeyHex: string;
+}
+
+export interface InboxSessionPayload {
+  address: string;
+  exp: number;
 }
 
 /**
@@ -178,6 +183,56 @@ export async function verifyInboxAuth(
     return verifyWalletAuth(parsed, config, store);
   }
   return verifyLegacyAuth(parsed as { pubkey: string; payload: AuthPayload; signature: string }, config, store);
+}
+
+function base64UrlEncode(value: Buffer | string): string {
+  return Buffer.from(value).toString('base64url');
+}
+
+function base64UrlDecode(value: string): Buffer {
+  return Buffer.from(value, 'base64url');
+}
+
+function getSessionSecret(config: Config): Buffer {
+  return createHash('sha256')
+    .update(`stackmail-session-v1|${config.serverPrivateKey}|${config.serverStxAddress}|${config.chainId}`)
+    .digest();
+}
+
+export function issueInboxSessionToken(address: string, config: Config): { token: string; expiresAt: number } {
+  const exp = Date.now() + config.inboxSessionTtlMs;
+  const payload: InboxSessionPayload = { address, exp };
+  const payloadEncoded = base64UrlEncode(JSON.stringify(payload));
+  const sig = createHmac('sha256', getSessionSecret(config)).update(payloadEncoded).digest();
+  return {
+    token: `${payloadEncoded}.${base64UrlEncode(sig)}`,
+    expiresAt: exp,
+  };
+}
+
+export function verifyInboxSessionToken(token: string, config: Config): InboxSessionPayload {
+  const [payloadEncoded, sigEncoded] = token.split('.');
+  if (!payloadEncoded || !sigEncoded) {
+    throw new AuthError(401, 'invalid inbox session token', 'invalid-session');
+  }
+  const expectedSig = createHmac('sha256', getSessionSecret(config)).update(payloadEncoded).digest();
+  const actualSig = base64UrlDecode(sigEncoded);
+  if (actualSig.length !== expectedSig.length || !timingSafeEqual(actualSig, expectedSig)) {
+    throw new AuthError(401, 'invalid inbox session token', 'invalid-session');
+  }
+  let payload: InboxSessionPayload;
+  try {
+    payload = JSON.parse(base64UrlDecode(payloadEncoded).toString('utf-8')) as InboxSessionPayload;
+  } catch {
+    throw new AuthError(401, 'invalid inbox session token', 'invalid-session');
+  }
+  if (!payload.address || typeof payload.address !== 'string' || typeof payload.exp !== 'number') {
+    throw new AuthError(401, 'invalid inbox session token', 'invalid-session');
+  }
+  if (Date.now() > payload.exp) {
+    throw new AuthError(401, 'inbox session expired', 'session-expired');
+  }
+  return payload;
 }
 
 /** Format 1: raw secp256k1 sig over sha256(JSON(payload)) — for agents */

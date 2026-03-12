@@ -151,7 +151,7 @@
     .form-group { margin-bottom: 16px; }
     label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; font-weight: 500; }
 
-    input[type=text], textarea {
+    input[type=text], input[type=password], textarea {
       width: 100%;
       background: var(--bg);
       border: 1px solid var(--border);
@@ -163,7 +163,7 @@
       outline: none;
       transition: border-color 0.15s;
     }
-    input[type=text]:focus, textarea:focus { border-color: var(--accent); }
+    input[type=text]:focus, input[type=password]:focus, textarea:focus { border-color: var(--accent); }
     textarea { resize: vertical; min-height: 100px; }
 
     /* ── Mono / address ─────────────────────────────────────────────── */
@@ -226,6 +226,16 @@
     }
 
     .msg-amount { font-size: 12px; color: var(--muted); white-space: nowrap; }
+    .msg-body {
+      margin-top: 12px;
+      padding: 12px;
+      background: var(--surface2);
+      border: 1px solid var(--border2);
+      border-radius: var(--radius);
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+    }
 
     /* ── Spinner ─────────────────────────────────────────────────────── */
     .spinner {
@@ -508,6 +518,22 @@
         <div style="margin-top:6px;font-size:12px;color:var(--muted)">
           Share this address so others can send you messages.
         </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">Inbox Decrypt Key</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
+          Leather signs inbox actions, but it does not expose ECIES decryption. For browser testing, load the matching secp256k1 private key here. The key is used locally in this tab and stored only in session storage.
+        </div>
+        <div class="form-group" style="margin-bottom:10px">
+          <label for="decrypt-key-input">Private key (64 hex chars, or 66 with trailing 01)</label>
+          <input type="password" id="decrypt-key-input" placeholder="hex private key for this inbox address" spellcheck="false" autocomplete="off" />
+        </div>
+        <div class="row">
+          <button class="btn btn-secondary" id="save-decrypt-key-btn">Load Decrypt Key</button>
+          <button class="btn btn-secondary" id="clear-decrypt-key-btn">Clear</button>
+        </div>
+        <div id="decrypt-key-status" style="margin-top:12px"></div>
       </div>
 
       <div class="row" style="margin-bottom:16px">

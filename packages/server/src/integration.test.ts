@@ -21,6 +21,7 @@ import type { Server } from 'node:http';
 
 class MockPaymentService implements IPaymentService {
   trackedTapState: Awaited<ReturnType<NonNullable<IPaymentService['getTrackedTapState']>>> = null;
+  outgoingPaymentEnabled = true;
 
   async verifyIncomingPayment(proofRaw: string): Promise<VerifiedPayment> {
     let proof: Record<string, unknown>;
@@ -40,8 +41,34 @@ class MockPaymentService implements IPaymentService {
     return { hashedSecret, incomingAmount: amount, senderAddress };
   }
 
-  async createOutgoingPayment(): Promise<PendingPayment | null> {
-    return null;
+  async createOutgoingPayment(args: {
+    hashedSecret: string;
+    incomingAmount: string;
+    recipientAddr: string;
+    contractId: string;
+  }): Promise<PendingPayment | null> {
+    if (!this.outgoingPaymentEnabled) return null;
+    return {
+      stateProof: {
+        contractId: args.contractId,
+        pipeKey: {
+          'principal-1': args.recipientAddr,
+          'principal-2': 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir',
+          token: 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token',
+        },
+        forPrincipal: args.recipientAddr,
+        withPrincipal: 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir',
+        myBalance: '900',
+        theirBalance: '100',
+        nonce: '1',
+        action: '1',
+        actor: 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir',
+        hashedSecret: args.hashedSecret,
+        theirSignature: '0x' + '11'.repeat(65),
+      },
+      amount: String(BigInt(args.incomingAmount) - 100n),
+      hashedSecret: args.hashedSecret,
+    };
   }
 
   async createTapWithBorrowedLiquidityParams(_: {
@@ -140,6 +167,8 @@ const serverConfig: Config = {
   messagePriceSats: '1000',
   minFeeSats: '100',
   maxPendingPerSender: 5,
+  maxPendingPerRecipient: 20,
+  inboxSessionTtlMs: 300_000,
 };
 
 let server: Server;
@@ -217,8 +246,75 @@ describe('GET /tap/state', () => {
   });
 });
 
+describe('recipient public key registration', () => {
+  it('persists the inbox auth pubkey and exposes it via GET /payment-info/:addr', async () => {
+    const authHeader = buildAuthHeader({
+      pubkey: recipientSignKeypair.compressedPubkeyHex,
+      action: 'get-inbox',
+      address: recipientAddress,
+      privateKey: recipientSignKeypair.privateKey,
+    });
+
+    const inboxRes = await fetch(`${baseUrl}/inbox`, {
+      headers: { 'x-stackmail-auth': authHeader },
+    });
+    expect(inboxRes.status).toBe(200);
+
+    const paymentInfoRes = await fetch(`${baseUrl}/payment-info/${recipientAddress}`);
+    expect(paymentInfoRes.status).toBe(200);
+    const paymentInfo = await paymentInfoRes.json() as {
+      recipientPublicKey: string;
+      amount: string;
+      fee: string;
+      recipientAmount: string;
+      serverAddress: string;
+    };
+    expect(paymentInfo.recipientPublicKey).toBe(recipientSignKeypair.compressedPubkeyHex);
+    expect(paymentInfo.amount).toBe(serverConfig.messagePriceSats);
+    expect(paymentInfo.fee).toBe(serverConfig.minFeeSats);
+    expect(paymentInfo.recipientAmount).toBe('900');
+    expect(paymentInfo.serverAddress).toBe(serverConfig.reservoirContractId);
+  });
+
+  it('persists the sender pubkey when a message includes fromPublicKey', async () => {
+    const senderAddress = pubkeyToStxAddress(senderPubkeyHex);
+    const secretHex = randomBytes(32).toString('hex');
+    const hashedSecretHex = hashSecret(secretHex);
+    const encryptedPayload = encryptMail(
+      { v: 1, secret: secretHex, body: 'Reply path registration test' },
+      recipientEncryptPubkeyHex,
+    );
+
+    const proof = JSON.stringify({
+      hashedSecret: hashedSecretHex,
+      forPrincipal: senderAddress,
+      amount: '1000',
+    });
+
+    const sendRes = await fetch(`${baseUrl}/messages/${recipientAddress}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-x402-payment': proof,
+      },
+      body: JSON.stringify({
+        from: senderAddress,
+        fromPublicKey: senderPubkeyHex,
+        encryptedPayload,
+      }),
+    });
+    expect(sendRes.status).toBe(200);
+
+    const paymentInfoRes = await fetch(`${baseUrl}/payment-info/${senderAddress}`);
+    expect(paymentInfoRes.status).toBe(200);
+    const paymentInfo = await paymentInfoRes.json() as { recipientPublicKey: string };
+    expect(paymentInfo.recipientPublicKey).toBe(senderPubkeyHex);
+  });
+});
+
 describe('full send → inbox → preview → claim flow', () => {
   let messageId: string;
+  let inboxSessionToken = '';
 
   it('step 1: GET /inbox authenticates successfully', async () => {
     const authHeader = buildAuthHeader({
@@ -232,6 +328,8 @@ describe('full send → inbox → preview → claim flow', () => {
       headers: { 'x-stackmail-auth': authHeader },
     });
     expect(res.status).toBe(200);
+    inboxSessionToken = res.headers.get('x-stackmail-session') ?? '';
+    expect(inboxSessionToken).toBeTruthy();
     const body = await res.json() as { messages: unknown[] };
     expect(Array.isArray(body.messages)).toBe(true);
   });
@@ -290,18 +388,13 @@ describe('full send → inbox → preview → claim flow', () => {
   });
 
   it('step 4: GET /inbox/:id/preview returns encrypted payload', async () => {
-    const authHeader = buildAuthHeader({
-      pubkey: recipientSignKeypair.compressedPubkeyHex,
-      action: 'get-message',
-      address: recipientAddress,
-      messageId,
-      privateKey: recipientSignKeypair.privateKey,
-    });
-
     const res = await fetch(`${baseUrl}/inbox/${messageId}/preview`, {
-      headers: { 'x-stackmail-auth': authHeader },
+      headers: { 'x-stackmail-session': inboxSessionToken },
     });
     expect(res.status).toBe(200);
+    const refreshedSession = res.headers.get('x-stackmail-session') ?? '';
+    expect(refreshedSession).toBeTruthy();
+    inboxSessionToken = refreshedSession;
     const body = await res.json() as Record<string, unknown>;
     expect(body.messageId).toBe(messageId);
     expect(body.encryptedPayload).toBeDefined();
@@ -311,19 +404,11 @@ describe('full send → inbox → preview → claim flow', () => {
   });
 
   it('step 5: POST /inbox/:id/claim with wrong secret returns 400', async () => {
-    const authHeader = buildAuthHeader({
-      pubkey: recipientSignKeypair.compressedPubkeyHex,
-      action: 'claim-message',
-      address: recipientAddress,
-      messageId,
-      privateKey: recipientSignKeypair.privateKey,
-    });
-
     const res = await fetch(`${baseUrl}/inbox/${messageId}/claim`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-stackmail-auth': authHeader,
+        'x-stackmail-session': inboxSessionToken,
       },
       body: JSON.stringify({ secret: randomBytes(32).toString('hex') }),
     });
@@ -333,17 +418,11 @@ describe('full send → inbox → preview → claim flow', () => {
   });
 
   it('step 6: full preview → decrypt → claim round-trip succeeds', async () => {
-    const previewAuth = buildAuthHeader({
-      pubkey: recipientSignKeypair.compressedPubkeyHex,
-      action: 'get-message',
-      address: recipientAddress,
-      messageId,
-      privateKey: recipientSignKeypair.privateKey,
-    });
     const previewRes = await fetch(`${baseUrl}/inbox/${messageId}/preview`, {
-      headers: { 'x-stackmail-auth': previewAuth },
+      headers: { 'x-stackmail-session': inboxSessionToken },
     });
     expect(previewRes.status).toBe(200);
+    inboxSessionToken = previewRes.headers.get('x-stackmail-session') ?? inboxSessionToken;
     const preview = await previewRes.json() as { encryptedPayload: { v: 1; epk: string; iv: string; data: string } };
 
     const decrypted = decryptMail(preview.encryptedPayload, recipientEncryptPrivkeyHex);
@@ -351,18 +430,11 @@ describe('full send → inbox → preview → claim flow', () => {
     expect(decrypted.body).toBe('Hello from integration test');
     const secretHex = decrypted.secret;
 
-    const claimAuth = buildAuthHeader({
-      pubkey: recipientSignKeypair.compressedPubkeyHex,
-      action: 'claim-message',
-      address: recipientAddress,
-      messageId,
-      privateKey: recipientSignKeypair.privateKey,
-    });
     const claimRes = await fetch(`${baseUrl}/inbox/${messageId}/claim`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-stackmail-auth': claimAuth,
+        'x-stackmail-session': inboxSessionToken,
       },
       body: JSON.stringify({ secret: secretHex }),
     });
@@ -390,6 +462,42 @@ describe('full send → inbox → preview → claim flow', () => {
     expect(claimRes.status).toBe(409);
     const body = await claimRes.json() as { error: string };
     expect(body.error).toBe('already-claimed');
+  });
+});
+
+describe('recipient tap requirement', () => {
+  it('rejects sending when the server cannot create the outgoing recipient payment', async () => {
+    paymentService.outgoingPaymentEnabled = false;
+    const secretHex = randomBytes(32).toString('hex');
+    const hashedSecretHex = hashSecret(secretHex);
+    const encryptedPayload = encryptMail(
+      { v: 1, secret: secretHex, body: 'Should fail without recipient tap' },
+      recipientEncryptPubkeyHex,
+    );
+
+    const proof = JSON.stringify({
+      hashedSecret: hashedSecretHex,
+      forPrincipal: pubkeyToStxAddress(senderPubkeyHex),
+      amount: '1000',
+    });
+
+    const res = await fetch(`${baseUrl}/messages/${recipientAddress}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-x402-payment': proof,
+      },
+      body: JSON.stringify({
+        from: pubkeyToStxAddress(senderPubkeyHex),
+        fromPublicKey: senderPubkeyHex,
+        encryptedPayload,
+      }),
+    });
+
+    expect(res.status).toBe(409);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe('recipient-payment-unavailable');
+    paymentService.outgoingPaymentEnabled = true;
   });
 });
 
@@ -587,6 +695,40 @@ describe('per-sender HTLC cap', () => {
     expect(res.status).toBe(429);
     const body = await res.json() as { error: string };
     expect(body.error).toBe('too-many-pending');
+
+    await new Promise<void>((r, j) => capServer.close(e => e ? j(e) : r()));
+  });
+
+  it('rejects when recipient inbox exceeds maxPendingPerRecipient unclaimed messages', async () => {
+    const capStore = new SqliteMessageStore(':memory:');
+    await capStore.init();
+
+    const capService = new MockPaymentService();
+    const capConfig = { ...serverConfig, maxPendingPerRecipient: 2 };
+    const capServer = createMailServer(capConfig, capStore, capService);
+    await new Promise<void>(r => capServer.listen(0, '127.0.0.1', () => r()));
+    const capUrl = `http://127.0.0.1:${(capServer.address() as AddressInfo).port}`;
+
+    const capRecipient = pubkeyToStxAddress(recipientSignKeypair.compressedPubkeyHex);
+
+    const sendMsg = async (sender: string) => {
+      const secretHex = randomBytes(32).toString('hex');
+      const hashedSecretHex = hashSecret(secretHex);
+      const enc = encryptMail({ v: 1, secret: secretHex, body: `hi from ${sender}` }, recipientEncryptPubkeyHex);
+      const proof = JSON.stringify({ hashedSecret: hashedSecretHex, forPrincipal: sender, amount: '1000' });
+      return fetch(`${capUrl}/messages/${capRecipient}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-x402-payment': proof },
+        body: JSON.stringify({ from: sender, encryptedPayload: enc }),
+      });
+    };
+
+    expect((await sendMsg('SP_SENDER_1')).status).toBe(200);
+    expect((await sendMsg('SP_SENDER_2')).status).toBe(200);
+    const res = await sendMsg('SP_SENDER_3');
+    expect(res.status).toBe(429);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe('recipient-inbox-full');
 
     await new Promise<void>((r, j) => capServer.close(e => e ? j(e) : r()));
   });

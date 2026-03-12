@@ -1,4 +1,5 @@
 import { secp256k1 } from '@noble/curves/secp256k1';
+import { gcm } from '@noble/ciphers/aes.js';
 import { sha256 } from '@noble/hashes/sha256';
 import { hkdf } from '@noble/hashes/hkdf';
 import {
@@ -91,6 +92,35 @@ function extractAddresses(
     ?? (resp as { addresses?: Array<{ address: string; publicKey?: string }> })?.addresses
     ?? []
   );
+}
+
+function extractSupportedMethods(resp: unknown): string[] {
+  return (
+    (resp as { result?: { methods?: Array<{ name?: string }> } })?.result?.methods?.map(m => m.name ?? '')
+      .filter(Boolean)
+    ?? []
+  );
+}
+
+function extractEncryptedMessage(resp: unknown): EncryptedMail | null {
+  return (
+    (resp as { result?: { encryptedMessage?: EncryptedMail } })?.result?.encryptedMessage
+    ?? (resp as { encryptedMessage?: EncryptedMail })?.encryptedMessage
+    ?? null
+  );
+}
+
+function extractDecryptedMessage(resp: unknown): string | null {
+  return (
+    (resp as { result?: { message?: string } })?.result?.message
+    ?? (resp as { message?: string })?.message
+    ?? null
+  );
+}
+
+function getLeatherProvider(): { request(method: string, params?: unknown): Promise<unknown> } | null {
+  return (window as { LeatherProvider?: { request(method: string, params?: unknown): Promise<unknown> } })
+    .LeatherProvider ?? null;
 }
 
 function isContractPrincipal(value: string): boolean {
@@ -365,6 +395,13 @@ interface EncryptedMail {
   data: string;
 }
 
+interface DecryptedMailPayload {
+  v: 1;
+  secret: string;
+  subject?: string;
+  body: string;
+}
+
 async function encryptMail(payload: unknown, recipientPubkeyHex: string): Promise<EncryptedMail> {
   const eskBytes    = secp256k1.utils.randomPrivateKey();
   const epkBytes    = secp256k1.getPublicKey(eskBytes, true);
@@ -376,9 +413,31 @@ async function encryptMail(payload: unknown, recipientPubkeyHex: string): Promis
   const key         = hkdf(sha256, sharedX, salt, info, 32);
   const iv          = crypto.getRandomValues(new Uint8Array(12));
   const plaintext   = new TextEncoder().encode(JSON.stringify(payload));
-  const cryptoKey   = await crypto.subtle.importKey('raw', new Uint8Array(key), 'AES-GCM', false, ['encrypt']);
-  const encrypted   = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, plaintext));
+  const encrypted   = gcm(new Uint8Array(key), iv).encrypt(plaintext);
   return { v: 1, epk: bytesToHex(epkBytes), iv: bytesToHex(iv), data: bytesToHex(encrypted) };
+}
+
+async function decryptMail(payload: EncryptedMail, privateKeyHex: string): Promise<DecryptedMailPayload> {
+  if (payload.v !== 1) throw new Error('Unsupported encrypted payload version');
+  const privateKey = hexToBytes(privateKeyHex);
+  const epk = hexToBytes(payload.epk);
+  const sharedFull = secp256k1.getSharedSecret(privateKey, epk, true);
+  const sharedX = sharedFull.slice(1);
+  const salt = new TextEncoder().encode('stackmail-v1');
+  const info = new TextEncoder().encode('encrypt');
+  const key = hkdf(sha256, sharedX, salt, info, 32);
+  const ivRaw = hexToBytes(payload.iv);
+  const iv = new Uint8Array(ivRaw.length);
+  iv.set(ivRaw);
+  const ciphertextBytes = hexToBytes(payload.data);
+  const ciphertext = new Uint8Array(ciphertextBytes.length);
+  ciphertext.set(ciphertextBytes);
+  const plaintext = gcm(new Uint8Array(key), iv).decrypt(ciphertext);
+  const parsed = JSON.parse(new TextDecoder().decode(plaintext)) as DecryptedMailPayload;
+  if (!parsed || parsed.v !== 1 || typeof parsed.secret !== 'string' || typeof parsed.body !== 'string') {
+    throw new Error('Decrypted payload is not valid Stackmail v1 mail');
+  }
+  return parsed;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,10 +448,19 @@ let walletAddress: string | null = null;
 let walletPubkey: string | null  = null;
 let serverStatus: Record<string, unknown> = {};
 let pipeState = { myBalance: 0n, serverBalance: 0n, nonce: 0n };
+let inboxDecryptPrivateKey: string | null = null;
+let walletCryptoAvailable = false;
+let lastInboxMessages: InboxMessage[] = [];
+let inboxActionMessageId: string | null = null;
+const openedInboxMessages: Record<string, DecryptedMailPayload> = {};
+const inboxMessageErrors: Record<string, string> = {};
 
 // Auth header cache for get-inbox (avoids wallet popup on every inbox load)
 let cachedGetInboxAuth: string | null = null;
 let cachedGetInboxAuthExpiry = 0;
+let inboxSessionToken: string | null = null;
+let inboxSessionExpiresAt = 0;
+const DECRYPT_KEY_STORAGE_KEY = 'stackmail.inboxDecryptPrivateKey';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App state machine
@@ -406,6 +474,133 @@ function setAppState(state: 'no-wallet' | 'checking' | 'no-tap' | 'tx-pending' |
   (document.getElementById('panel-tx-pending') as HTMLElement).style.display = state === 'tx-pending' ? '' : 'none';
   (document.getElementById('panel-main')       as HTMLElement).style.display = state === 'ready'      ? '' : 'none';
   (document.getElementById('main-nav')         as HTMLElement).style.display = state === 'ready'      ? '' : 'none';
+}
+
+function normalizePrivateKeyHex(value: string): string | null {
+  const normalized = value.trim().replace(/^0x/, '').toLowerCase();
+  if (!normalized) return null;
+  if (/^[0-9a-f]{64}$/.test(normalized)) return normalized;
+  // Stacks wallets often export 33-byte compressed private keys with a trailing `01`.
+  if (/^[0-9a-f]{66}$/.test(normalized) && normalized.endsWith('01')) {
+    return normalized.slice(0, 64);
+  }
+  return null;
+}
+
+function maskPrivateKey(value: string): string {
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function validateDecryptKeyForWallet(privateKeyHex: string): void {
+  const derivedPubkey = bytesToHex(secp256k1.getPublicKey(hexToBytes(privateKeyHex), true));
+  if (walletPubkey && derivedPubkey !== walletPubkey.toLowerCase()) {
+    throw new Error('Decrypt key does not match the connected wallet public key');
+  }
+}
+
+function updateDecryptKeyStatus(kind: 'info' | 'success' | 'warning' | 'error', message: string): void {
+  const statusEl = document.getElementById('decrypt-key-status') as HTMLElement | null;
+  if (!statusEl) return;
+  const cls = kind === 'info'
+    ? 'alert-info'
+    : kind === 'success'
+      ? 'alert-success'
+      : kind === 'warning'
+        ? 'alert-warning'
+        : 'alert-error';
+  statusEl.innerHTML = `<div class="alert ${cls}">${escHtml(message)}</div>`;
+}
+
+function updateDecryptKeyUI(): void {
+  const input = document.getElementById('decrypt-key-input') as HTMLInputElement | null;
+  const saveBtn = document.getElementById('save-decrypt-key-btn') as HTMLButtonElement | null;
+  const clearBtn = document.getElementById('clear-decrypt-key-btn') as HTMLButtonElement | null;
+  if (!input || !saveBtn || !clearBtn) return;
+
+  clearBtn.disabled = !inboxDecryptPrivateKey;
+  if (inboxDecryptPrivateKey) {
+    input.value = '';
+    saveBtn.textContent = 'Replace Decrypt Key';
+    updateDecryptKeyStatus('success', `Decrypt key loaded: ${maskPrivateKey(inboxDecryptPrivateKey)}`);
+  } else if (walletCryptoAvailable) {
+    saveBtn.textContent = 'Load Decrypt Key';
+    updateDecryptKeyStatus('info', 'Leather wallet decrypt is available. Local key entry is optional fallback.');
+  } else {
+    saveBtn.textContent = 'Load Decrypt Key';
+    updateDecryptKeyStatus('info', 'Load the local decrypt key to claim and open encrypted messages in the browser.');
+  }
+}
+
+function saveDecryptKey(): void {
+  const input = document.getElementById('decrypt-key-input') as HTMLInputElement;
+  const normalized = normalizePrivateKeyHex(input.value);
+  if (!normalized) {
+    updateDecryptKeyStatus('warning', 'Enter a 64-char hex private key or a 66-char Stacks private key ending in 01.');
+    return;
+  }
+
+  try {
+    validateDecryptKeyForWallet(normalized);
+    inboxDecryptPrivateKey = normalized;
+    sessionStorage.setItem(DECRYPT_KEY_STORAGE_KEY, normalized);
+    input.value = '';
+    updateDecryptKeyUI();
+    if (lastInboxMessages.length) renderInboxMessages(lastInboxMessages);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    updateDecryptKeyStatus('error', message);
+  }
+}
+
+function clearDecryptKey(): void {
+  inboxDecryptPrivateKey = null;
+  sessionStorage.removeItem(DECRYPT_KEY_STORAGE_KEY);
+  updateDecryptKeyUI();
+  if (lastInboxMessages.length) renderInboxMessages(lastInboxMessages);
+}
+
+function restoreDecryptKeyFromSession(): void {
+  const stored = sessionStorage.getItem(DECRYPT_KEY_STORAGE_KEY);
+  if (!stored) {
+    updateDecryptKeyUI();
+    return;
+  }
+  const normalized = normalizePrivateKeyHex(stored);
+  if (!normalized) {
+    sessionStorage.removeItem(DECRYPT_KEY_STORAGE_KEY);
+    updateDecryptKeyUI();
+    return;
+  }
+  try {
+    validateDecryptKeyForWallet(normalized);
+    inboxDecryptPrivateKey = normalized;
+    updateDecryptKeyUI();
+  } catch {
+    inboxDecryptPrivateKey = null;
+    sessionStorage.removeItem(DECRYPT_KEY_STORAGE_KEY);
+    updateDecryptKeyStatus('warning', 'Stored decrypt key did not match the connected wallet and was cleared.');
+  }
+}
+
+async function refreshWalletCryptoAvailability(): Promise<void> {
+  const provider = getLeatherProvider();
+  if (!provider) {
+    walletCryptoAvailable = false;
+    updateDecryptKeyUI();
+    return;
+  }
+
+  try {
+    const resp = await provider.request('supportedMethods');
+    const methods = extractSupportedMethods(resp);
+    walletCryptoAvailable =
+      methods.includes('stx_encryptMessage') && methods.includes('stx_decryptMessage');
+  } catch {
+    walletCryptoAvailable = false;
+  }
+
+  updateDecryptKeyUI();
+  if (lastInboxMessages.length) renderInboxMessages(lastInboxMessages);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -471,9 +666,13 @@ async function connectWallet(): Promise<void> {
     if (!mainnetAcct?.address) throw new Error('Wallet returned no address.');
 
     walletAddress = mainnetAcct.address;
-    walletPubkey  = mainnetAcct.publicKey ?? null;
+    walletPubkey  = typeof mainnetAcct.publicKey === 'string'
+      ? mainnetAcct.publicKey.replace(/^0x/, '').toLowerCase()
+      : null;
 
     updateWalletUI();
+    restoreDecryptKeyFromSession();
+    await refreshWalletCryptoAvailability();
     await onWalletConnected();
   } catch (e) {
     const msg = typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error');
@@ -486,10 +685,18 @@ async function connectWallet(): Promise<void> {
 function disconnectWallet(): void {
   walletAddress = null;
   walletPubkey  = null;
+  walletCryptoAvailable = false;
   pipeState     = { myBalance: 0n, serverBalance: 0n, nonce: 0n };
+  lastInboxMessages = [];
+  inboxActionMessageId = null;
   cachedGetInboxAuth = null;
   cachedGetInboxAuthExpiry = 0;
+  inboxSessionToken = null;
+  inboxSessionExpiresAt = 0;
+  for (const key of Object.keys(openedInboxMessages)) delete openedInboxMessages[key];
+  for (const key of Object.keys(inboxMessageErrors)) delete inboxMessageErrors[key];
   updateWalletUI();
+  clearDecryptKey();
   setAppState('no-wallet');
 }
 
@@ -522,7 +729,7 @@ async function onWalletConnected(): Promise<void> {
   }
 
   const tap = await withTimeout(
-    queryOnChainTap(walletAddress!),
+    resolveTapState(walletAddress!),
     20_000,
     'On-chain tap query timeout',
   ).catch(() => null);
@@ -683,6 +890,18 @@ interface TapState {
   pipeKey: PipeKey;
 }
 
+interface TrackedTapResponse {
+  ok?: boolean;
+  tap?: {
+    contractId?: string;
+    token?: string | null;
+    pipeKey?: PipeKey;
+    serverBalance?: string;
+    myBalance?: string;
+    nonce?: string;
+  } | null;
+}
+
 function cvPrincipalHex(addr: string): string {
   return bytesToHex(serializeCVBytes(principalCV(addr)));
 }
@@ -706,7 +925,16 @@ function parseUintCv(value: ClarityValue | undefined): bigint | null {
   return null;
 }
 
-function parsePipeResult(result: string): { balance1: bigint; balance2: bigint; nonce: bigint } | null {
+function parsePendingAmountCv(value: ClarityValue | undefined): bigint {
+  if (!value) return 0n;
+  if (value.type === ClarityType.OptionalNone) return 0n;
+  if (value.type !== ClarityType.OptionalSome) return 0n;
+  const inner = value.value;
+  if (inner.type !== ClarityType.Tuple) return 0n;
+  return parseUintCv((inner.value as Record<string, ClarityValue>).amount) ?? 0n;
+}
+
+function parsePipeResult(result: string): { balance1: bigint; balance2: bigint; pending1: bigint; pending2: bigint; nonce: bigint } | null {
   if (!result) return null;
   if (result === '0x09') return null; // (none)
 
@@ -720,9 +948,11 @@ function parsePipeResult(result: string): { balance1: bigint; balance2: bigint; 
       const tuple = cv.value as Record<string, ClarityValue>;
       const balance1 = parseUintCv(tuple['balance-1']);
       const balance2 = parseUintCv(tuple['balance-2']);
+      const pending1 = parsePendingAmountCv(tuple['pending-1']);
+      const pending2 = parsePendingAmountCv(tuple['pending-2']);
       const nonce = parseUintCv(tuple.nonce);
       if (balance1 == null || balance2 == null || nonce == null) return null;
-      return { balance1, balance2, nonce };
+      return { balance1, balance2, pending1, pending2, nonce };
     } catch {
       return null;
     }
@@ -731,11 +961,15 @@ function parsePipeResult(result: string): { balance1: bigint; balance2: bigint; 
   // Fallback for older/plain repr responses.
   const b1m = result.match(/balance-1 u(\d+)/);
   const b2m = result.match(/balance-2 u(\d+)/);
+  const p1m = result.match(/pending-1 \((?:some )?\(tuple \(amount u(\d+)\)/);
+  const p2m = result.match(/pending-2 \((?:some )?\(tuple \(amount u(\d+)\)/);
   const ncm = result.match(/nonce u(\d+)/);
   if (!b1m || !b2m || !ncm) return null;
   return {
     balance1: BigInt(b1m[1]),
     balance2: BigInt(b2m[1]),
+    pending1: p1m ? BigInt(p1m[1]) : 0n,
+    pending2: p2m ? BigInt(p2m[1]) : 0n,
     nonce: BigInt(ncm[1]),
   };
 }
@@ -778,12 +1012,39 @@ async function queryOnChainTap(userAddr: string): Promise<TapState | null> {
 
     const userIsP1 = pipeKey['principal-1'] === userAddr;
     return {
-      userBalance:      userIsP1 ? parsed.balance1 : parsed.balance2,
-      reservoirBalance: userIsP1 ? parsed.balance2 : parsed.balance1,
+      userBalance:      userIsP1 ? parsed.balance1 + parsed.pending1 : parsed.balance2 + parsed.pending2,
+      reservoirBalance: userIsP1 ? parsed.balance2 + parsed.pending2 : parsed.balance1 + parsed.pending1,
       nonce: parsed.nonce,
       pipeKey,
     };
   } catch { return null; }
+}
+
+async function queryTrackedTapState(userAddr: string): Promise<TapState | null> {
+  if (!walletAddress || walletAddress !== userAddr) return null;
+  try {
+    const response = await apiFetch('/tap/state', {
+      headers: await buildInboxRequestHeaders('get-inbox'),
+    });
+    captureInboxSession(response);
+    if (!response.ok) return null;
+    const data = await response.json() as TrackedTapResponse;
+    if (!data.tap?.pipeKey || data.tap.myBalance == null || data.tap.serverBalance == null || data.tap.nonce == null) {
+      return null;
+    }
+    return {
+      userBalance: BigInt(data.tap.myBalance),
+      reservoirBalance: BigInt(data.tap.serverBalance),
+      nonce: BigInt(data.tap.nonce),
+      pipeKey: data.tap.pipeKey,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function resolveTapState(userAddr: string): Promise<TapState | null> {
+  return await queryTrackedTapState(userAddr) ?? await queryOnChainTap(userAddr);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -932,7 +1193,7 @@ async function checkTapAfterTx(): Promise<void> {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Checking…';
 
-  const tap = await queryOnChainTap(walletAddress!);
+  const tap = await resolveTapState(walletAddress!);
   if (tap) {
     pipeState = { myBalance: tap.userBalance, serverBalance: tap.reservoirBalance, nonce: tap.nonce };
     updateIdentityUI();
@@ -963,6 +1224,27 @@ async function apiFetch(path: string, opts: RequestInit = {}): Promise<Response>
   }
 }
 
+function captureInboxSession(response: Response): void {
+  const token = response.headers.get('x-stackmail-session');
+  const expiresAtRaw = response.headers.get('x-stackmail-session-expires-at');
+  const expiresAt = expiresAtRaw ? Number(expiresAtRaw) : 0;
+  if (token && Number.isFinite(expiresAt) && expiresAt > Date.now()) {
+    inboxSessionToken = token;
+    inboxSessionExpiresAt = expiresAt;
+  }
+}
+
+async function buildInboxRequestHeaders(
+  action: 'get-inbox' | 'claim-message' | 'get-message',
+  messageId?: string,
+  extraHeaders: Record<string, string> = {},
+): Promise<Record<string, string>> {
+  if (inboxSessionToken && Date.now() < inboxSessionExpiresAt) {
+    return { ...extraHeaders, 'x-stackmail-session': inboxSessionToken };
+  }
+  return { ...extraHeaders, 'x-stackmail-auth': await buildWalletAuthHeader(action, messageId) };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Inbox tab
 // ─────────────────────────────────────────────────────────────────────────────
@@ -972,23 +1254,26 @@ async function loadInbox(): Promise<void> {
   const statusEl = document.getElementById('inbox-status') as HTMLElement;
   const claimed  = (document.getElementById('show-claimed-cb') as HTMLInputElement).checked;
 
-  statusEl.innerHTML = '<span class="spinner"></span> Waiting for wallet signature…';
+  statusEl.innerHTML = inboxSessionToken && Date.now() < inboxSessionExpiresAt
+    ? '<span class="spinner"></span> Loading inbox…'
+    : '<span class="spinner"></span> Waiting for wallet signature…';
   listEl.innerHTML   = '';
 
   try {
-    const auth = await buildWalletAuthHeader('get-inbox');
     statusEl.innerHTML = '<span class="spinner"></span> Loading inbox…';
     const r    = await apiFetch(`/inbox?limit=50${claimed ? '&claimed=true' : ''}`, {
-      headers: { 'x-stackmail-auth': auth },
+      headers: await buildInboxRequestHeaders('get-inbox'),
     });
+    captureInboxSession(r);
     if (!r.ok) {
       const err = await r.json().catch(() => ({})) as { message?: string };
       statusEl.innerHTML = `<div class="alert alert-error">Error: ${escHtml(err.message || String(r.status))}</div>`;
       return;
     }
     const data = await r.json() as { messages?: InboxMessage[] };
+    lastInboxMessages = data.messages || [];
     statusEl.innerHTML = '';
-    renderInboxMessages(data.messages || []);
+    renderInboxMessages(lastInboxMessages);
   } catch (e) {
     const msg = typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error');
     statusEl.innerHTML = `<div class="alert alert-error">Failed to load inbox: ${escHtml(msg)}</div>`;
@@ -1001,6 +1286,105 @@ interface InboxMessage {
   sentAt: number;
   amount?: number | string;
   claimed?: boolean;
+}
+
+function setComposeRecipient(address: string, subject = ''): void {
+  const toInput = document.getElementById('to-input') as HTMLInputElement;
+  const subjectInput = document.getElementById('subject-input') as HTMLInputElement;
+  const bodyInput = document.getElementById('body-input') as HTMLTextAreaElement;
+  const sendStatus = document.getElementById('send-status') as HTMLElement;
+  const recipientStatus = document.getElementById('recipient-status') as HTMLElement;
+  const paymentPanel = document.getElementById('payment-panel') as HTMLElement;
+  const sendBtn = document.getElementById('send-btn') as HTMLButtonElement;
+
+  toInput.value = address;
+  subjectInput.value = subject;
+  recipientInfo = null;
+  recipientStatus.textContent = '';
+  paymentPanel.style.display = 'none';
+  sendStatus.innerHTML = '';
+  sendBtn.disabled = true;
+  bodyInput.focus();
+}
+
+async function replyToMessage(messageId: string): Promise<void> {
+  const message = lastInboxMessages.find(entry => entry.id === messageId);
+  if (!message?.from) throw new Error('Reply target not found');
+  const opened = openedInboxMessages[messageId];
+  const subject = opened?.subject?.trim() ? `Re: ${opened.subject}` : '';
+  setComposeRecipient(message.from, subject);
+  showTab('compose');
+  await fetchRecipientInfo(message.from);
+}
+
+interface PreviewMessageResponse {
+  messageId: string;
+  from: string;
+  sentAt: number;
+  amount: string;
+  hashedSecret: string;
+  encryptedPayload: EncryptedMail;
+}
+
+interface ClaimedMessageResponse {
+  message: {
+    id: string;
+    paymentId: string;
+    encryptedPayload: EncryptedMail;
+  };
+}
+
+function requireInboxDecryptKey(): string {
+  if (!inboxDecryptPrivateKey) {
+    throw new Error('Load your inbox decrypt key first. The UI accepts 64-char hex or 66-char Stacks keys ending in 01.');
+  }
+  return inboxDecryptPrivateKey;
+}
+
+function parseWalletDecryptedMail(message: string): DecryptedMailPayload {
+  const parsed = JSON.parse(message) as Partial<DecryptedMailPayload>;
+  if (!parsed || parsed.v !== 1 || typeof parsed.secret !== 'string' || typeof parsed.body !== 'string') {
+    throw new Error('Wallet returned an invalid Stackmail payload');
+  }
+  return parsed as DecryptedMailPayload;
+}
+
+async function encryptMailWithWallet(payload: unknown, recipientPubkeyHex: string): Promise<EncryptedMail> {
+  const provider = getLeatherProvider();
+  if (!provider) throw new Error('Leather provider not available');
+  const resp = await provider.request('stx_encryptMessage', {
+    message: JSON.stringify(payload),
+    publicKey: recipientPubkeyHex,
+  });
+  const encrypted = extractEncryptedMessage(resp);
+  if (!encrypted) throw new Error('Wallet did not return an encrypted payload');
+  return encrypted;
+}
+
+async function decryptMailWithWallet(payload: EncryptedMail): Promise<DecryptedMailPayload> {
+  const provider = getLeatherProvider();
+  if (!provider) throw new Error('Leather provider not available');
+  const resp = await provider.request('stx_decryptMessage', { encryptedMessage: payload });
+  const message = extractDecryptedMessage(resp);
+  if (!message) throw new Error('Wallet did not return decrypted plaintext');
+  return parseWalletDecryptedMail(message);
+}
+
+async function decryptInboxPayload(payload: EncryptedMail): Promise<DecryptedMailPayload> {
+  if (walletCryptoAvailable) {
+    try {
+      return await decryptMailWithWallet(payload);
+    } catch (error) {
+      if (!inboxDecryptPrivateKey) throw error;
+    }
+  }
+
+  const privateKey = requireInboxDecryptKey();
+  return decryptMail(payload, privateKey);
+}
+
+function updateInboxMessage(messages: InboxMessage[], messageId: string, patch: Partial<InboxMessage>): InboxMessage[] {
+  return messages.map(message => message.id === messageId ? { ...message, ...patch } : message);
 }
 
 function renderInboxMessages(messages: InboxMessage[]): void {
@@ -1032,6 +1416,20 @@ function renderInboxMessages(messages: InboxMessage[]): void {
     const badge = msg.claimed
       ? '<span class="badge badge-green">✓ Claimed</span>'
       : '<span class="badge badge-purple">Pending</span>';
+    const decryptReady = Boolean(inboxDecryptPrivateKey) || walletCryptoAvailable;
+    const isBusy = inboxActionMessageId === msg.id;
+    const actionHtml = msg.claimed
+      ? `<button class="btn btn-secondary btn-sm" data-action="open-message" data-message-id="${escHtml(msg.id)}" ${decryptReady ? '' : 'disabled'}>${isBusy ? '<span class="spinner"></span> Opening…' : 'Open'}</button>
+         <button class="btn btn-secondary btn-sm" data-action="reply-message" data-message-id="${escHtml(msg.id)}">Reply</button>`
+      : `<button class="btn btn-primary btn-sm" data-action="claim-message" data-message-id="${escHtml(msg.id)}" ${decryptReady ? '' : 'disabled'}>${isBusy ? '<span class="spinner"></span> Claiming…' : 'Claim & Open'}</button>`;
+    const decryptHint = walletCryptoAvailable
+      ? '<span style="color:var(--muted)">Leather can decrypt this message with the connected wallet.</span>'
+      : decryptReady
+        ? '<span style="color:var(--muted)">Encrypted message ready to decrypt locally.</span>'
+        : '<span style="color:var(--yellow)">Load your inbox decrypt key to claim and open this message.</span>';
+    const opened = openedInboxMessages[msg.id];
+    const messageError = inboxMessageErrors[msg.id];
+    const subject = opened?.subject?.trim() ? opened.subject : '(no subject)';
 
     el.innerHTML = `
       <div class="msg-header">
@@ -1041,15 +1439,98 @@ function renderInboxMessages(messages: InboxMessage[]): void {
         </div>
         <div class="msg-meta">
           ${badge}
-          <span class="msg-amount">${Number(msg.amount || 0).toLocaleString()} sats</span>
+          <span class="msg-amount">${escHtml(formatPaymentAmount(msg.amount || 0))}</span>
         </div>
       </div>
-      <div style="margin-top:10px;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)">
+      <div style="margin-top:10px;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);flex-wrap:wrap">
         <span>🔒</span>
-        <span>Message content is encrypted — wallet decryption (ECIES) coming soon</span>
-      </div>`;
+        ${decryptHint}
+      </div>
+      <div class="row" style="margin-top:10px">
+        ${actionHtml}
+      </div>
+      ${messageError ? `<div class="alert alert-error" style="margin-top:10px">${escHtml(messageError)}</div>` : ''}
+      ${opened ? `
+        <div class="msg-body">
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Subject</div>
+          <div style="margin-bottom:12px">${escHtml(subject)}</div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Body</div>
+          <div>${escHtml(opened.body)}</div>
+        </div>` : ''}`;
 
     listEl.appendChild(el);
+  }
+}
+
+async function fetchPreviewMessage(messageId: string): Promise<PreviewMessageResponse> {
+  const response = await apiFetch(`/inbox/${encodeURIComponent(messageId)}/preview`, {
+    headers: await buildInboxRequestHeaders('get-message', messageId),
+  });
+  captureInboxSession(response);
+  const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) throw new Error(String(data.message ?? data.error ?? `Preview failed: ${response.status}`));
+  return data as unknown as PreviewMessageResponse;
+}
+
+async function fetchClaimedMessage(messageId: string): Promise<ClaimedMessageResponse> {
+  const response = await apiFetch(`/inbox/${encodeURIComponent(messageId)}`, {
+    headers: await buildInboxRequestHeaders('get-message', messageId),
+  });
+  captureInboxSession(response);
+  const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) throw new Error(String(data.message ?? data.error ?? `Fetch failed: ${response.status}`));
+  return data as unknown as ClaimedMessageResponse;
+}
+
+async function claimAndOpenMessage(messageId: string): Promise<void> {
+  inboxActionMessageId = messageId;
+  delete inboxMessageErrors[messageId];
+  renderInboxMessages(lastInboxMessages);
+
+  try {
+    const preview = await fetchPreviewMessage(messageId);
+    const decrypted = await decryptInboxPayload(preview.encryptedPayload);
+    const expectedHash = bytesToHex(sha256(hexToBytes(decrypted.secret)));
+    if (expectedHash !== preview.hashedSecret) {
+      throw new Error('Decrypted secret does not match the payment hash commitment');
+    }
+
+    const response = await apiFetch(`/inbox/${encodeURIComponent(messageId)}/claim`, {
+      method: 'POST',
+      headers: await buildInboxRequestHeaders('claim-message', messageId, {
+        'content-type': 'application/json',
+      }),
+      body: JSON.stringify({ secret: decrypted.secret }),
+    });
+    captureInboxSession(response);
+    const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+    if (!response.ok) throw new Error(String(data.message ?? data.error ?? `Claim failed: ${response.status}`));
+
+    openedInboxMessages[messageId] = decrypted;
+    lastInboxMessages = updateInboxMessage(lastInboxMessages, messageId, { claimed: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    inboxMessageErrors[messageId] = message;
+  } finally {
+    inboxActionMessageId = null;
+    renderInboxMessages(lastInboxMessages);
+  }
+}
+
+async function openClaimedMessage(messageId: string): Promise<void> {
+  inboxActionMessageId = messageId;
+  delete inboxMessageErrors[messageId];
+  renderInboxMessages(lastInboxMessages);
+
+  try {
+    const claimed = await fetchClaimedMessage(messageId);
+    openedInboxMessages[messageId] = await decryptInboxPayload(claimed.message.encryptedPayload);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    inboxMessageErrors[messageId] = message;
+  } finally {
+    inboxActionMessageId = null;
+    renderInboxMessages(lastInboxMessages);
   }
 }
 
@@ -1064,6 +1545,15 @@ interface RecipientInfo {
 }
 
 let recipientInfo: RecipientInfo | null = null;
+
+function getPaymentUnitLabel(): string {
+  return getRuntimeSupportedTokenAssetName() ?? 'microstx';
+}
+
+function formatPaymentAmount(amount: string | number | bigint): string {
+  const value = typeof amount === 'bigint' ? amount : BigInt(String(amount));
+  return `${value.toLocaleString()} ${getPaymentUnitLabel()}`;
+}
 
 async function lookupRecipientPubkey(addr: string): Promise<string | null> {
   try {
@@ -1083,6 +1573,27 @@ async function lookupRecipientPubkey(addr: string): Promise<string | null> {
   } catch { return null; }
 }
 
+async function fetchRecipientPaymentInfo(addr: string): Promise<RecipientInfo | null> {
+  const r = await apiFetch(`/payment-info/${encodeURIComponent(addr)}`);
+  const data = await r.json().catch(() => ({})) as {
+    recipientPublicKey?: string;
+    serverAddress?: string;
+    amount?: string | number;
+  };
+  if (r.status === 404) return null;
+  if (!r.ok) {
+    throw new Error(String((data as { message?: string; error?: string }).message ?? (data as { error?: string }).error ?? `payment-info failed: ${r.status}`));
+  }
+  if (!data.recipientPublicKey || !data.serverAddress || data.amount == null) {
+    throw new Error('payment-info response missing required fields');
+  }
+  return {
+    recipientPublicKey: data.recipientPublicKey,
+    serverAddress: data.serverAddress,
+    amount: data.amount,
+  };
+}
+
 async function fetchRecipientInfo(toAddr: string): Promise<void> {
   const el = document.getElementById('recipient-status') as HTMLElement;
   el.innerHTML = '<span class="spinner"></span> Looking up recipient…';
@@ -1096,36 +1607,41 @@ async function fetchRecipientInfo(toAddr: string): Promise<void> {
 
   try {
     await ensureSupportedTokenLoaded();
-    const recipientPublicKey = await lookupRecipientPubkey(toAddr);
-    if (!recipientPublicKey) {
-      resetErr('No transaction history found — recipient must have sent at least one Stacks transaction to receive mail.');
-      return;
+    const serverPaymentInfo = await fetchRecipientPaymentInfo(toAddr);
+    if (serverPaymentInfo) {
+      recipientInfo = serverPaymentInfo;
+      el.innerHTML  = `<span style="color:var(--green)">✓ Recipient is registered with this Stackmail server</span>`;
+    } else {
+      const recipientPublicKey = await lookupRecipientPubkey(toAddr);
+      if (!recipientPublicKey) {
+        resetErr('Recipient has not registered with this server and has no discoverable outbound Stacks public key yet.');
+        return;
+      }
+
+      const price      = (serverStatus.messagePriceSats as string | number | undefined) ?? '1000';
+      const serverAddr = (serverStatus.serverAddress as string | undefined) ?? '';
+      recipientInfo = { recipientPublicKey, serverAddress: serverAddr, amount: price };
+      el.innerHTML  = `<span style="color:var(--green)">✓ Recipient public key recovered from chain history</span>`;
     }
 
-    const price      = (serverStatus.messagePriceSats as string | number | undefined) ?? '1000';
-    const serverAddr = (serverStatus.serverAddress as string | undefined) ?? '';
-
-    recipientInfo = { recipientPublicKey, serverAddress: serverAddr, amount: price };
-    el.innerHTML  = `<span style="color:var(--green)">✓ Public key found — ready to send</span>`;
-
     (document.getElementById('payment-panel') as HTMLElement).style.display = '';
-    (document.getElementById('pay-price') as HTMLElement).textContent   = `${Number(price).toLocaleString()} sats`;
-    (document.getElementById('pay-balance') as HTMLElement).textContent = `${pipeState.myBalance.toLocaleString()} sats`;
+    (document.getElementById('pay-price') as HTMLElement).textContent   = formatPaymentAmount(recipientInfo.amount);
+    (document.getElementById('pay-balance') as HTMLElement).textContent = formatPaymentAmount(pipeState.myBalance);
     (document.getElementById('pay-nonce') as HTMLElement).textContent   = `${pipeState.nonce}`;
 
-    const tap = await queryOnChainTap(walletAddress!);
+    const tap = await resolveTapState(walletAddress!);
     if (tap) {
       pipeState = { myBalance: tap.userBalance, serverBalance: tap.reservoirBalance, nonce: tap.nonce };
-      (document.getElementById('pay-balance') as HTMLElement).textContent = `${pipeState.myBalance.toLocaleString()} sats`;
+      (document.getElementById('pay-balance') as HTMLElement).textContent = formatPaymentAmount(pipeState.myBalance);
       (document.getElementById('pay-nonce') as HTMLElement).textContent   = `${pipeState.nonce}`;
       (document.getElementById('tap-status') as HTMLElement).innerHTML =
-        `<span style="color:var(--green)">✓ Channel open — ${pipeState.myBalance.toLocaleString()} sats available</span>`;
+        `<span style="color:var(--green)">✓ Channel open — ${escHtml(formatPaymentAmount(pipeState.myBalance))} available</span>`;
+      (document.getElementById('send-btn') as HTMLButtonElement).disabled = pipeState.myBalance < BigInt(String(recipientInfo.amount));
     } else {
       (document.getElementById('tap-status') as HTMLElement).innerHTML =
         `<span style="color:var(--red)">✗ No channel found on-chain</span>`;
+      (document.getElementById('send-btn') as HTMLButtonElement).disabled = true;
     }
-
-    (document.getElementById('send-btn') as HTMLButtonElement).disabled = false;
 
   } catch (e) {
     resetErr(typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error'));
@@ -1166,13 +1682,16 @@ async function sendMessage(): Promise<void> {
     const hashedSecretHex = bytesToHex(sha256(secretBytes));
 
     // Encrypt payload
-    const encryptedPayload = await encryptMail(
-      { v: 1, secret: secretHex, subject: subject || undefined, body },
-      recipientInfo.recipientPublicKey,
-    );
+    const mailPayload = { v: 1 as const, secret: secretHex, subject: subject || undefined, body };
+    const encryptedPayload = walletCryptoAvailable
+      ? await encryptMailWithWallet(mailPayload, recipientInfo.recipientPublicKey)
+      : await encryptMail(mailPayload, recipientInfo.recipientPublicKey);
 
     // Update pipe state
     const price            = BigInt(recipientInfo.amount || '1000');
+    if (pipeState.myBalance < price) {
+      throw new Error(`Insufficient channel balance. Need ${formatPaymentAmount(price)}, have ${formatPaymentAmount(pipeState.myBalance)}.`);
+    }
     const newServerBalance = pipeState.serverBalance + price;
     const newMyBalance     = pipeState.myBalance - price;
     const newNonce         = pipeState.nonce + 1n;
@@ -1217,7 +1736,7 @@ async function sendMessage(): Promise<void> {
         'content-type':        'application/json',
         'x-stackmail-payment': btoa(JSON.stringify(proof)),
       },
-      body: JSON.stringify({ from: senderAddr, encryptedPayload }),
+      body: JSON.stringify({ from: senderAddr, fromPublicKey: walletPubkey, encryptedPayload }),
     });
 
     const data = await r.json().catch(() => ({})) as { messageId?: string; message?: string; error?: string };
@@ -1225,7 +1744,7 @@ async function sendMessage(): Promise<void> {
 
     // Commit state
     pipeState = { myBalance: newMyBalance, serverBalance: newServerBalance, nonce: newNonce };
-    (document.getElementById('pay-balance') as HTMLElement).textContent = `${pipeState.myBalance.toLocaleString()} sats`;
+    (document.getElementById('pay-balance') as HTMLElement).textContent = formatPaymentAmount(pipeState.myBalance);
     (document.getElementById('pay-nonce') as HTMLElement).textContent   = `${pipeState.nonce}`;
 
     statusEl.innerHTML = `
@@ -1279,7 +1798,7 @@ async function loadStatus(): Promise<void> {
     (document.getElementById('s-addr') as HTMLElement).textContent     = String(data.serverAddress || '—');
     (document.getElementById('s-contract') as HTMLElement).textContent = String(data.sfContract    || '—');
     (document.getElementById('s-price') as HTMLElement).textContent    = data.messagePriceSats
-      ? `${Number(data.messagePriceSats).toLocaleString()} sats` : '—';
+      ? formatPaymentAmount(String(data.messagePriceSats)) : '—';
     (document.getElementById('s-network') as HTMLElement).textContent  = data.network
       ? String(data.network).charAt(0).toUpperCase() + String(data.network).slice(1) : '—';
     const adminAgentInput = document.getElementById('admin-agent-input') as HTMLInputElement | null;
@@ -1309,10 +1828,17 @@ function updateIdentityUI(): void {
   if (!tapEl) return;
   if (pipeState.nonce > 0n || pipeState.myBalance > 0n) {
     tapEl.innerHTML = `
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px">
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;margin-bottom:8px">
+        Effective liquidity shown below includes pending channel balance when available.
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:4px">
         <div>
-          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Your balance</div>
-          <div style="font-size:15px;color:var(--text)">${pipeState.myBalance.toLocaleString()} <span style="font-size:11px">sats</span></div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Send capacity</div>
+          <div style="font-size:15px;color:var(--text)">${escHtml(formatPaymentAmount(pipeState.myBalance))}</div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Receive liquidity</div>
+          <div style="font-size:15px;color:var(--text)">${escHtml(formatPaymentAmount(pipeState.serverBalance))}</div>
         </div>
         <div>
           <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Nonce</div>
@@ -1496,9 +2022,32 @@ document.querySelectorAll<HTMLButtonElement>('.tab-btn').forEach(btn => {
 
 document.getElementById('refresh-inbox-btn')!.addEventListener('click', loadInbox);
 document.getElementById('show-claimed-cb')!.addEventListener('change', loadInbox);
+document.getElementById('save-decrypt-key-btn')!.addEventListener('click', saveDecryptKey);
+document.getElementById('clear-decrypt-key-btn')!.addEventListener('click', clearDecryptKey);
 document.getElementById('send-btn')!.addEventListener('click', sendMessage);
 document.getElementById('admin-set-agent-btn')!.addEventListener('click', setReservoirAgent);
 document.getElementById('admin-set-rate-btn')!.addEventListener('click', setBorrowRate);
+document.getElementById('inbox-list')!.addEventListener('click', async (event) => {
+  const target = event.target as HTMLElement | null;
+  const button = target?.closest<HTMLButtonElement>('button[data-action][data-message-id]');
+  if (!button) return;
+
+  const action = button.dataset.action;
+  const messageId = button.dataset.messageId;
+  if (!action || !messageId) return;
+
+  if (action === 'claim-message') {
+    await claimAndOpenMessage(messageId);
+    return;
+  }
+  if (action === 'open-message') {
+    await openClaimedMessage(messageId);
+    return;
+  }
+  if (action === 'reply-message') {
+    await replyToMessage(messageId);
+  }
+});
 
 document.getElementById('copy-inbox-addr-btn')!.addEventListener('click', () => {
   copyToClipboard(walletAddress || '');
@@ -1532,4 +2081,5 @@ document.getElementById('to-input')!.addEventListener('input', (e) => {
 // Bootstrap
 // ─────────────────────────────────────────────────────────────────────────────
 
+updateDecryptKeyUI();
 setAppState('no-wallet');

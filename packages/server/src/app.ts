@@ -52,7 +52,7 @@ export interface IPaymentService {
     nonce: string;
   } | null>;
 }
-import { verifyInboxAuth, AuthError, AUTH_DOMAIN } from './auth.js';
+import { verifyInboxAuth, verifyInboxSessionToken, issueInboxSessionToken, pubkeyToStxAddress, AuthError, AUTH_DOMAIN } from './auth.js';
 import { verifySecretHash } from '@stackmail/crypto';
 
 export function createMailServer(
@@ -65,6 +65,21 @@ export function createMailServer(
   const __filename = fileURLToPath(import.meta.url);
   const WEB_DIR = join(dirname(__filename), '..', 'web');
   const WEB_DIR_RESOLVED = resolve(WEB_DIR);
+
+  function buildPaymentInfo(recipientAddr: string, recipientPublicKey: string) {
+    const amount = BigInt(config.messagePriceSats);
+    const fee = BigInt(config.minFeeSats);
+    const recipientAmount = amount > fee ? amount - fee : 0n;
+    return {
+      recipientPublicKey,
+      amount: amount.toString(),
+      fee: fee.toString(),
+      recipientAmount: recipientAmount.toString(),
+      stackflowNodeUrl: config.stackflowNodeUrl,
+      serverAddress: pipeCounterparty,
+      recipientAddr,
+    };
+  }
 
   // ─── Handlers ──────────────────────────────────────────────────────────────
 
@@ -99,7 +114,7 @@ export function createMailServer(
       return json(res, 413, { error: 'body-too-large' });
     }
 
-    let data: { encryptedPayload: unknown; from: string };
+    let data: { encryptedPayload: unknown; from: string; fromPublicKey?: string };
     try {
       data = JSON.parse(body) as typeof data;
     } catch {
@@ -114,6 +129,24 @@ export function createMailServer(
         error: 'sender-mismatch',
         message: 'body.from must match the sender authenticated by the payment proof',
       });
+    }
+    if (data.fromPublicKey != null) {
+      if (typeof data.fromPublicKey !== 'string' || !/^0[23][0-9a-f]{64}$/i.test(data.fromPublicKey)) {
+        return json(res, 400, {
+          error: 'invalid-from-public-key',
+          message: 'body.fromPublicKey must be a compressed secp256k1 public key hex string',
+        });
+      }
+      const normalizedPubkey = data.fromPublicKey.toLowerCase();
+      const derivedMainnet = pubkeyToStxAddress(normalizedPubkey);
+      const derivedTestnet = pubkeyToStxAddress(normalizedPubkey, true);
+      if (derivedMainnet !== data.from && derivedTestnet !== data.from) {
+        return json(res, 400, {
+          error: 'sender-public-key-mismatch',
+          message: 'body.fromPublicKey does not match body.from',
+        });
+      }
+      await store.savePublicKey(data.from, normalizedPubkey);
     }
 
     if (!data.encryptedPayload || typeof data.encryptedPayload !== 'object') {
@@ -140,6 +173,13 @@ export function createMailServer(
         message: `Too many unclaimed messages from this sender (limit: ${config.maxPendingPerSender})`,
       });
     }
+    const recipientPendingCount = await store.countPendingToRecipient(to);
+    if (recipientPendingCount >= config.maxPendingPerRecipient) {
+      return json(res, 429, {
+        error: 'recipient-inbox-full',
+        message: `Recipient inbox already has too many unclaimed messages (limit: ${config.maxPendingPerRecipient})`,
+      });
+    }
 
     const pendingPayment = sfContractId
       ? await paymentService.createOutgoingPayment({
@@ -149,6 +189,13 @@ export function createMailServer(
           contractId: sfContractId,
         })
       : null;
+
+    if (sfContractId && pendingPayment == null) {
+      return json(res, 409, {
+        error: 'recipient-payment-unavailable',
+        message: 'recipient does not have a tracked tap with the reservoir yet, or reservoir liquidity is insufficient',
+      });
+    }
 
     const msgId = randomUUID();
     await store.saveMessage({
@@ -345,9 +392,22 @@ export function createMailServer(
             pipeKey: tap.pipeKey,
             serverBalance: tap.serverBalance,
             myBalance: tap.counterpartyBalance,
+            sendCapacity: tap.counterpartyBalance,
+            receiveLiquidity: tap.serverBalance,
             nonce: tap.nonce,
           },
     });
+  }
+
+  async function handlePaymentInfo(res: ServerResponse, recipientAddr: string): Promise<void> {
+    const recipientPublicKey = await store.getPublicKey(recipientAddr);
+    if (!recipientPublicKey) {
+      return json(res, 404, {
+        error: 'recipient-not-found',
+        message: 'recipient has not registered a Stackmail inbox public key yet',
+      });
+    }
+    return json(res, 200, buildPaymentInfo(recipientAddr, recipientPublicKey));
   }
 
   // ─── Request router ─────────────────────────────────────────────────────────
@@ -359,7 +419,8 @@ export function createMailServer(
 
     // CORS for web UI
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'content-type, x-stackmail-auth, x-stackmail-payment, x-x402-payment');
+    res.setHeader('Access-Control-Allow-Headers', 'content-type, x-stackmail-auth, x-stackmail-session, x-stackmail-payment, x-x402-payment');
+    res.setHeader('Access-Control-Expose-Headers', 'x-stackmail-session, x-stackmail-session-expires-at');
     if (method === 'OPTIONS') {
       res.writeHead(204); res.end(); return;
     }
@@ -387,6 +448,11 @@ export function createMailServer(
 
     if (method === 'GET' && path === '/tap/state') {
       return handleTapState(req, res);
+    }
+
+    const paymentInfoMatch = path.match(/^\/payment-info\/([^/]+)$/);
+    if (method === 'GET' && paymentInfoMatch) {
+      return handlePaymentInfo(res, decodeURIComponent(paymentInfoMatch[1]));
     }
 
     // Serve web UI (index.html + Vite-built assets)
@@ -452,9 +518,34 @@ export function createMailServer(
     res: ServerResponse,
     expected: { action: 'get-inbox' | 'claim-message' | 'get-message'; messageId?: string },
   ): Promise<Awaited<ReturnType<typeof verifyInboxAuth>> | null> {
+    const sessionHeader = req.headers['x-stackmail-session'];
+    if (sessionHeader) {
+      try {
+        const session = verifyInboxSessionToken(Array.isArray(sessionHeader) ? sessionHeader[0] : sessionHeader, config);
+        const refreshed = issueInboxSessionToken(session.address, config);
+        res.setHeader('x-stackmail-session', refreshed.token);
+        res.setHeader('x-stackmail-session-expires-at', String(refreshed.expiresAt));
+        return {
+          payload: {
+            action: expected.action,
+            address: session.address,
+            timestamp: Date.now(),
+            ...(expected.messageId != null ? { messageId: expected.messageId } : {}),
+          },
+          pubkeyHex: '',
+        };
+      } catch (err) {
+        if (err instanceof AuthError) {
+          json(res, err.statusCode, { error: err.reason, message: err.message });
+          return null;
+        }
+        throw err;
+      }
+    }
+
     const authHeader = req.headers['x-stackmail-auth'];
     if (!authHeader) {
-      json(res, 401, { error: 'auth-required', message: 'x-stackmail-auth header required' });
+      json(res, 401, { error: 'auth-required', message: 'x-stackmail-auth or x-stackmail-session header required' });
       return null;
     }
 
@@ -464,6 +555,10 @@ export function createMailServer(
         config,
         store,
       );
+      await store.savePublicKey(auth.payload.address, auth.pubkeyHex);
+      const session = issueInboxSessionToken(auth.payload.address, config);
+      res.setHeader('x-stackmail-session', session.token);
+      res.setHeader('x-stackmail-session-expires-at', String(session.expiresAt));
       if (auth.payload.action !== expected.action) {
         json(res, 403, { error: 'auth-action-mismatch', message: `expected action ${expected.action}` });
         return null;

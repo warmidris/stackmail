@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { generateKeyPairSync, createSign } from 'node:crypto';
-import { verifyInboxAuth, pubkeyToStxAddress } from './auth.js';
+import { verifyInboxAuth, verifyInboxSessionToken, issueInboxSessionToken, pubkeyToStxAddress } from './auth.js';
 import type { MessageStore } from './store.js';
 import type { Config } from './types.js';
 
@@ -63,12 +63,16 @@ const testConfig: Config = {
   messagePriceSats: '1000',
   minFeeSats: '100',
   maxPendingPerSender: 5,
+  maxPendingPerRecipient: 20,
+  inboxSessionTtlMs: 300_000,
 };
 
 /** Minimal in-memory MessageStore stub. */
 function makeMockStore(): MessageStore {
   return {
     init: async () => {},
+    savePublicKey: async () => {},
+    getPublicKey: async () => null,
     savePendingPaymentInfo: async () => {},
     consumePendingPaymentInfo: async () => null,
     saveMessage: async () => {},
@@ -78,6 +82,7 @@ function makeMockStore(): MessageStore {
     getClaimedMessage: async () => null,
     markPaymentSettled: async () => {},
     countPendingFromSender: async () => 0,
+    countPendingToRecipient: async () => 0,
   };
 }
 
@@ -181,5 +186,21 @@ describe('pubkeyToStxAddress', () => {
     const { compressedPubkeyHex: k1 } = generateTestKeypair();
     const { compressedPubkeyHex: k2 } = generateTestKeypair();
     expect(pubkeyToStxAddress(k1)).not.toBe(pubkeyToStxAddress(k2));
+  });
+});
+
+describe('inbox session tokens', () => {
+  it('issues and verifies a valid token', () => {
+    const token = issueInboxSessionToken('SP123SESSION', testConfig);
+    const payload = verifyInboxSessionToken(token.token, testConfig);
+    expect(payload.address).toBe('SP123SESSION');
+    expect(payload.exp).toBeGreaterThan(Date.now());
+  });
+
+  it('rejects tampered tokens', () => {
+    const token = issueInboxSessionToken('SP123SESSION', testConfig);
+    const [payload, _sig] = token.token.split('.');
+    const tampered = `${payload}.AAAA`;
+    expect(() => verifyInboxSessionToken(tampered, testConfig)).toThrow('invalid inbox session token');
   });
 });

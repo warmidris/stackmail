@@ -30,6 +30,23 @@ describe('SqliteMessageStore', () => {
     await expect(makeStore().init()).resolves.toBeUndefined();
   });
 
+  describe('public key registry', () => {
+    it('saves and retrieves a registered recipient public key', async () => {
+      const store = makeStore();
+      await store.init();
+      await store.savePublicKey('SP1RECIPIENT', '02' + '11'.repeat(32));
+      await expect(store.getPublicKey('SP1RECIPIENT')).resolves.toBe('02' + '11'.repeat(32));
+    });
+
+    it('updates an existing recipient public key', async () => {
+      const store = makeStore();
+      await store.init();
+      await store.savePublicKey('SP1RECIPIENT', '02' + '11'.repeat(32));
+      await store.savePublicKey('SP1RECIPIENT', '03' + '22'.repeat(32));
+      await expect(store.getPublicKey('SP1RECIPIENT')).resolves.toBe('03' + '22'.repeat(32));
+    });
+  });
+
   describe('messages', () => {
     it('saves and retrieves a message', async () => {
       const store = makeStore();
@@ -171,6 +188,23 @@ describe('SqliteMessageStore', () => {
       const msg = makeMessage();
       await store.saveMessage(msg);
       await expect(store.markPaymentSettled(msg.paymentId)).resolves.toBeUndefined();
+    });
+
+    it('counts pending messages per sender and per recipient', async () => {
+      const store = makeStore();
+      await store.init();
+      const msg1 = makeMessage({ from: 'SP1SENDER1', to: 'SP1ALICE' });
+      const msg2 = makeMessage({ from: 'SP1SENDER1', to: 'SP1ALICE' });
+      const msg3 = makeMessage({ from: 'SP1SENDER2', to: 'SP1ALICE' });
+      const msg4 = makeMessage({ from: 'SP1SENDER1', to: 'SP1BOB' });
+      await store.saveMessage(msg1);
+      await store.saveMessage(msg2);
+      await store.saveMessage(msg3);
+      await store.saveMessage(msg4);
+      await store.claimMessage(msg2.id, 'SP1ALICE');
+
+      expect(await store.countPendingFromSender('SP1SENDER1', 'SP1ALICE')).toBe(1);
+      expect(await store.countPendingToRecipient('SP1ALICE')).toBe(2);
     });
   });
 

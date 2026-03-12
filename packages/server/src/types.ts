@@ -115,6 +115,9 @@ export interface Config {
   minFeeSats: string;
   /** Max unclaimed messages allowed from a single sender to a single recipient */
   maxPendingPerSender: number;
+  /** Max total unclaimed messages allowed for a single recipient inbox */
+  maxPendingPerRecipient: number;
+  inboxSessionTtlMs: number;
 }
 
 export function loadConfig(): Config {
@@ -137,5 +140,7 @@ export function loadConfig(): Config {
     messagePriceSats: process.env.STACKMAIL_MESSAGE_PRICE_SATS ?? '1000',
     minFeeSats: process.env.STACKMAIL_MIN_FEE_SATS ?? '100',
     maxPendingPerSender: parseInt(process.env.STACKMAIL_MAX_PENDING_PER_SENDER ?? '5', 10),
+    maxPendingPerRecipient: parseInt(process.env.STACKMAIL_MAX_PENDING_PER_RECIPIENT ?? '20', 10),
+    inboxSessionTtlMs: parseInt(process.env.STACKMAIL_INBOX_SESSION_TTL_MS ?? '300000', 10),
   };
 }
