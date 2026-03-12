@@ -18,7 +18,24 @@ See [DESIGN.md](./DESIGN.md) for full architecture details.
 ## Packages
 
 - [`packages/server`](./packages/server) — mailbox server
-- [`packages/client`](./packages/client) — agent-side client with polling loop
+- [`packages/client`](./packages/client) — composable agent-side client with polling loop
+
+## Agent Paths
+
+- [`packages/client`](./packages/client) is the library path if you already have your own StackFlow payment-proof builder.
+- [`scripts/stackmail-client.ts`](./scripts/stackmail-client.ts) is the standalone SDK path for agents that want a single drop-in file.
+- The standalone SDK now resolves live server config from `/status`, can recover the latest tracked tap state from `/tap/state`, and falls back to an on-chain tap read when the server has not tracked the channel yet.
+
+## Human Path
+
+- The web UI is served directly by the stackmail server at `/`.
+- Mailbox onboarding uses `sm-reservoir::create-tap-with-borrowed-liquidity`.
+- The UI reads live reservoir and StackFlow config from `/status` and verifies tap existence on-chain.
+
+## Operations
+
+- [`scripts/repair-mainnet-mailbox.mjs`](./scripts/repair-mainnet-mailbox.mjs) repairs the current mainnet mailbox path on the existing reservoir by setting the agent and borrowing receive liquidity.
+- [`scripts/recover-mainnet-reservoir.mjs`](./scripts/recover-mainnet-reservoir.mjs) deploys a fresh reservoir contract, initializes it, funds liquidity, opens a mailbox, and updates local env config. This path still requires enough deployer STX for contract deployment gas.
 
 ## Docker Persistence
 

@@ -52,11 +52,13 @@ const { encryptMail, decryptMail, hashSecret } =
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const SERVER      = 'http://127.0.0.1:8800';
-const RESERVOIR   = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir';
-const SF_CONTRACT = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow';
-const TOKEN       = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token';
-const CHAIN_ID    = 1;
+const SERVER      = process.env.STACKMAIL_SERVER_URL ?? 'http://127.0.0.1:8800';
+const RESERVOIR   = process.env.STACKMAIL_RESERVOIR_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir';
+const SF_CONTRACT = process.env.STACKMAIL_SF_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow';
+const TOKEN       = process.env.STACKMAIL_TOKEN_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token';
+const CHAIN_ID    = Number.parseInt(process.env.STACKMAIL_CHAIN_ID ?? '1', 10);
+const HIRO_API    = CHAIN_ID === 1 ? 'https://api.mainnet.hiro.so' : 'https://api.testnet.hiro.so';
+const EXPLORER_CHAIN = CHAIN_ID === 1 ? 'mainnet' : 'testnet';
 const MSG_PRICE   = 1000n;
 
 // ─── Address helpers ──────────────────────────────────────────────────────────
@@ -182,7 +184,7 @@ async function readOnChainPipeState(aliceAddr) {
   const pipeKey = canonicalPipeKey(TOKEN, aliceAddr, RESERVOIR);
   try {
     const resp = await fetch(
-      `https://api.mainnet.hiro.so/v2/contracts/call-read/SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR/sm-stackflow/get-pipe`,
+      `${HIRO_API}/v2/contracts/call-read/${SF_CONTRACT.split('.')[0]}/${SF_CONTRACT.split('.')[1]}/get-pipe`,
       {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -460,7 +462,7 @@ async function main() {
     console.log('    balance-2 (Reservoir):', pipeState.serverBalance.toString(), 'µTOKEN');
     console.log('    nonce:                ', pipeState.nonce.toString());
     console.log('\n  To close tap: sm-reservoir::force-cancel-tap (144-block dispute window)');
-    console.log('  Explorer: https://explorer.hiro.so/address/SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow?chain=mainnet');
+    console.log(`  Explorer: https://explorer.hiro.so/address/${SF_CONTRACT}?chain=${EXPLORER_CHAIN}`);
   }
 }
 

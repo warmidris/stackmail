@@ -20,6 +20,8 @@ import type { Server } from 'node:http';
 // ─── Mock payment service ──────────────────────────────────────────────────────
 
 class MockPaymentService implements IPaymentService {
+  trackedTapState: Awaited<ReturnType<NonNullable<IPaymentService['getTrackedTapState']>>> = null;
+
   async verifyIncomingPayment(proofRaw: string): Promise<VerifiedPayment> {
     let proof: Record<string, unknown>;
     try {
@@ -55,6 +57,20 @@ class MockPaymentService implements IPaymentService {
     mySignature: string;
   }): Promise<{ borrowFee: string; reservoirSignature: string }> {
     return { borrowFee: '0', reservoirSignature: '0x' + '00'.repeat(65) };
+  }
+
+  async getTrackedTapState(): Promise<{
+    contractId: string;
+    pipeKey: {
+      'principal-1': string;
+      'principal-2': string;
+      token: string | null;
+    };
+    serverBalance: string;
+    counterpartyBalance: string;
+    nonce: string;
+  } | null> {
+    return this.trackedTapState;
   }
 }
 
@@ -129,12 +145,13 @@ const serverConfig: Config = {
 let server: Server;
 let baseUrl: string;
 let store: SqliteMessageStore;
+let paymentService: MockPaymentService;
 
 beforeAll(async () => {
   store = new SqliteMessageStore(':memory:');
   await store.init();
 
-  const paymentService = new MockPaymentService();
+  paymentService = new MockPaymentService();
   server = createMailServer(serverConfig, store, paymentService);
 
   await new Promise<void>(resolve => {
@@ -159,6 +176,44 @@ describe('GET /health', () => {
     expect(res.status).toBe(200);
     const body = await res.json() as { ok: boolean };
     expect(body.ok).toBe(true);
+  });
+});
+
+describe('GET /tap/state', () => {
+  it('returns tracked channel state for the authenticated mailbox owner', async () => {
+    paymentService.trackedTapState = {
+      contractId: serverConfig.sfContractId,
+      pipeKey: {
+        'principal-1': recipientAddress,
+        'principal-2': serverConfig.reservoirContractId,
+        token: null,
+      },
+      serverBalance: '1200',
+      counterpartyBalance: '8800',
+      nonce: '3',
+    };
+
+    const authHeader = buildAuthHeader({
+      pubkey: recipientSignKeypair.compressedPubkeyHex,
+      action: 'get-inbox',
+      address: recipientAddress,
+      privateKey: recipientSignKeypair.privateKey,
+    });
+
+    const res = await fetch(`${baseUrl}/tap/state`, {
+      headers: { 'x-stackmail-auth': authHeader },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      ok: boolean;
+      tap: { contractId: string; serverBalance: string; myBalance: string; nonce: string; token: string | null };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.tap.contractId).toBe(serverConfig.sfContractId);
+    expect(body.tap.serverBalance).toBe('1200');
+    expect(body.tap.myBalance).toBe('8800');
+    expect(body.tap.nonce).toBe('3');
+    expect(body.tap.token).toBeNull();
   });
 });
 

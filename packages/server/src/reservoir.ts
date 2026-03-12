@@ -157,6 +157,37 @@ export class ReservoirService {
     this.initTables();
   }
 
+  async getTrackedTapState(counterparty: string): Promise<{
+    contractId: string;
+    pipeKey: { 'principal-1': string; 'principal-2': string; token: string | null };
+    serverBalance: string;
+    counterpartyBalance: string;
+    nonce: string;
+  } | null> {
+    if (!this.contractId) return null;
+    const principals = canonicalPipePrincipals(this.serverAddress, counterparty);
+    const row = this.getLatestPipeRowForPrincipals(
+      this.contractId,
+      principals['principal-1'],
+      principals['principal-2'],
+    );
+    if (!row) return null;
+
+    const pipeKey = JSON.parse(row.pipe_key_json) as {
+      'principal-1': string;
+      'principal-2': string;
+      token: string | null;
+    };
+
+    return {
+      contractId: row.contract_id,
+      pipeKey,
+      serverBalance: row.server_balance,
+      counterpartyBalance: row.counterparty_balance,
+      nonce: row.nonce,
+    };
+  }
+
   private initTables(): void {
     const db = this.assertDb();
     db.exec(`

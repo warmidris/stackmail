@@ -25,12 +25,12 @@ const { buildTransferMessage, sip018Sign, sip018Verify } =
 const { encryptMail, decryptMail, hashSecret, verifySecretHash } =
   await import('/agent/work/stackmail/packages/crypto/dist/index.js');
 
-const SERVER = 'http://127.0.0.1:8800';
+const SERVER = process.env.STACKMAIL_SERVER_URL ?? 'http://127.0.0.1:8800';
 // The reservoir contract IS the server's on-chain identity — pipes are opened to it
-const RESERVOIR = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir';
-const SF_CONTRACT = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow';
-const TOKEN = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token';
-const CHAIN_ID = 1;
+const RESERVOIR = process.env.STACKMAIL_RESERVOIR_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir';
+const SF_CONTRACT = process.env.STACKMAIL_SF_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow';
+const TOKEN = process.env.STACKMAIL_TOKEN_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token';
+const CHAIN_ID = Number.parseInt(process.env.STACKMAIL_CHAIN_ID ?? '1', 10);
 const MESSAGE_PRICE = 1000n;
 
 // ── c32 address helpers ───────────────────────────────────────────────────────
@@ -323,10 +323,10 @@ async function run() {
   console.log('╚════════════════════════════════════════════╝\n');
 
   console.log('Deployment summary:');
-  console.log('  sm-test-token : SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token');
-  console.log('  sm-stackflow  : SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow');
-  console.log('  sm-reservoir  : SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir');
-  console.log('  Server URL    : http://127.0.0.1:8800');
+  console.log(`  sm-test-token : ${TOKEN}`);
+  console.log(`  sm-stackflow  : ${SF_CONTRACT}`);
+  console.log(`  sm-reservoir  : ${RESERVOIR}`);
+  console.log(`  Server URL    : ${SERVER}`);
   console.log('  Alice →', alice.addr);
   console.log('  Bob   →', bob.addr);
 }

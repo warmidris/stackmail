@@ -40,6 +40,17 @@ export interface IPaymentService {
     borrowFee: string;
     reservoirSignature: string;
   }>;
+  getTrackedTapState?(counterparty: string): Promise<{
+    contractId: string;
+    pipeKey: {
+      'principal-1': string;
+      'principal-2': string;
+      token: string | null;
+    };
+    serverBalance: string;
+    counterpartyBalance: string;
+    nonce: string;
+  } | null>;
 }
 import { verifyInboxAuth, AuthError, AUTH_DOMAIN } from './auth.js';
 import { verifySecretHash } from '@stackmail/crypto';
@@ -316,6 +327,29 @@ export function createMailServer(
     }
   }
 
+  async function handleTapState(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const auth = await requireAuth(req, res, { action: 'get-inbox' });
+    if (!auth) return;
+
+    const tap = typeof paymentService.getTrackedTapState === 'function'
+      ? await paymentService.getTrackedTapState(auth.payload.address)
+      : null;
+
+    return json(res, 200, {
+      ok: true,
+      tap: tap == null
+        ? null
+        : {
+            contractId: tap.contractId,
+            token: tap.pipeKey.token,
+            pipeKey: tap.pipeKey,
+            serverBalance: tap.serverBalance,
+            myBalance: tap.counterpartyBalance,
+            nonce: tap.nonce,
+          },
+    });
+  }
+
   // ─── Request router ─────────────────────────────────────────────────────────
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -349,6 +383,10 @@ export function createMailServer(
         authDomain: AUTH_DOMAIN,
         sfVersion: '0.6.0',
       });
+    }
+
+    if (method === 'GET' && path === '/tap/state') {
+      return handleTapState(req, res);
     }
 
     // Serve web UI (index.html + Vite-built assets)

@@ -77,6 +77,22 @@ function extractSignature(resp: unknown): string | null {
     ?? null;
 }
 
+function extractPublicKey(resp: unknown): string | null {
+  return (resp as { result?: { publicKey?: string }; publicKey?: string })?.result?.publicKey
+    ?? (resp as { publicKey?: string })?.publicKey
+    ?? null;
+}
+
+function extractAddresses(
+  resp: unknown,
+): Array<{ address: string; publicKey?: string }> {
+  return (
+    (resp as { result?: { addresses?: Array<{ address: string; publicKey?: string }> } })?.result?.addresses
+    ?? (resp as { addresses?: Array<{ address: string; publicKey?: string }> })?.addresses
+    ?? []
+  );
+}
+
 function isContractPrincipal(value: string): boolean {
   return /^S[PT][0-9A-Z]{39}\.[a-zA-Z][a-zA-Z0-9-]{0,39}$/.test(value);
 }
@@ -401,20 +417,53 @@ async function connectWallet(): Promise<void> {
   btns.forEach(b => { b.disabled = true; b.textContent = 'Connecting…'; });
 
   try {
-    // getStacksProvider() detects Leather, Xverse, or any SIP-30 browser extension
-    const provider = getStacksProvider();
-    if (!provider) {
-      (document.getElementById('wallet-error') as HTMLElement).innerHTML =
-        '<div class="alert alert-warning">No Stacks wallet detected. Install <a href="https://leather.io" target="_blank" style="color:inherit">Leather</a> or <a href="https://xverse.app" target="_blank" style="color:inherit">Xverse</a> and refresh.</div>';
-      btns.forEach(b => { b.disabled = false; b.textContent = 'Connect Wallet'; });
-      return;
+    let accts: Array<{ address: string; publicKey?: string }> = [];
+
+    // Preferred path: Stacks Connect handles wallet selection and compatibility.
+    try {
+      const addrsResp = await withTimeout(
+        stacksRequest({ forceWalletSelect: true }, 'getAddresses'),
+        120_000,
+        'Timed out waiting for wallet connection. Open your wallet extension and approve the request.',
+      );
+      accts = extractAddresses(addrsResp);
+    } catch (err) {
+      try {
+        const addrsResp = await withTimeout(
+          stacksRequest({ forceWalletSelect: true }, 'stx_getAddresses'),
+          120_000,
+          'Timed out waiting for wallet connection. Open your wallet extension and approve the request.',
+        );
+        accts = extractAddresses(addrsResp);
+      } catch {
+        const provider = getStacksProvider();
+        if (!provider) {
+          throw err;
+        }
+        const addrsResp = await withTimeout(
+          provider.request('stx_getAddresses'),
+          120_000,
+          'Timed out waiting for wallet connection. Open your wallet extension and approve the request.',
+        );
+        accts = extractAddresses(addrsResp);
+      }
     }
 
-    const addrsResp = await provider.request('stx_getAddresses');
-    const accts: Array<{ address: string; publicKey?: string }> =
-      (addrsResp as { result?: { addresses?: Array<{ address: string; publicKey?: string }> } })?.result?.addresses
-      ?? (addrsResp as { addresses?: Array<{ address: string; publicKey?: string }> })?.addresses
-      ?? [];
+    if (!accts.length) {
+      const provider = getStacksProvider();
+      if (!provider) {
+        (document.getElementById('wallet-error') as HTMLElement).innerHTML =
+          '<div class="alert alert-warning">No Stacks wallet detected. Install <a href="https://leather.io" target="_blank" style="color:inherit">Leather</a> or <a href="https://xverse.app" target="_blank" style="color:inherit">Xverse</a> and refresh.</div>';
+        btns.forEach(b => { b.disabled = false; b.textContent = 'Connect Wallet'; });
+        return;
+      }
+    }
+
+    if (!accts.length) {
+      (document.getElementById('wallet-error') as HTMLElement).innerHTML =
+        '<div class="alert alert-error">Wallet connected, but no addresses were returned.</div>';
+      throw new Error('Wallet returned no addresses.');
+    }
     const mainnetAcct = accts.find(a => a.address?.startsWith('SP'))
       ?? accts.find(a => a.address?.startsWith('ST'))
       ?? accts[0];
@@ -512,32 +561,24 @@ async function buildWalletAuthHeader(action: string, messageId?: string): Promis
     ...(messageId ? { messageId: { type: 'string-ascii', value: messageId } } : {}),
   };
 
-  const domain = {
-    type: 'tuple',
-    data: {
-      'chain-id': { type: 'uint',         value: String(chainId) },
-      name:       { type: 'string-ascii', value: authDomain },
-      version:    { type: 'string-ascii', value: sfVersion },
-    },
-  };
-  const message = { type: 'tuple', data: msgFields };
+  const domainCV = tupleCV({
+    'chain-id': uintCV(chainId),
+    name: stringAsciiCV(authDomain),
+    version: stringAsciiCV(sfVersion),
+  });
+  const messageCV = tupleCV({
+    action: stringAsciiCV(action),
+    address: principalCV(walletAddress!),
+    timestamp: uintCV(BigInt(ts)),
+    ...(messageId ? { messageId: stringAsciiCV(messageId) } : {}),
+  });
 
-  const provider = getStacksProvider();
-  let resp: unknown;
-  try {
-    resp = await provider!.request('stx_signStructuredMessage', { message, domain });
-  } catch (e) {
-    const msg = (e as Error)?.message ?? '';
-    if (msg.includes('not supported') || msg.includes('structured')) {
-      throw new Error("Your wallet doesn't support structured data signing (SIP-018). Try Leather v6+");
-    }
-    throw e;
-  }
-  const signature = (resp as { result?: { signature?: string }; signature?: string })?.result?.signature
-    ?? (resp as { signature?: string })?.signature;
-  const pubkey    = (resp as { result?: { publicKey?: string }; publicKey?: string })?.result?.publicKey
-    ?? (resp as { publicKey?: string })?.publicKey
-    ?? walletPubkey;
+  const { signature, publicKey } = await withTimeout(
+    signStructuredMessageWithWallet(messageCV, domainCV, chainId),
+    120_000,
+    'Timed out waiting for wallet signature. Open your wallet extension and approve the SIP-018 request.',
+  );
+  const pubkey = publicKey ?? walletPubkey;
   if (!signature) throw new Error('Wallet returned no signature');
 
   const authHeader = btoa(JSON.stringify({ type: 'sip018', pubkey, message: msgFields, signature }));
@@ -560,6 +601,19 @@ async function sip018SignWithWallet(contractId: string, transferCV: ClarityValue
     name: stringAsciiCV(contractId),
     version: stringAsciiCV('0.6.0'),
   });
+  const signed = await signStructuredMessageWithWallet(
+    transferCV as ReturnType<typeof tupleCV>,
+    domainCV,
+    chainId,
+  );
+  return signed.signature;
+}
+
+async function signStructuredMessageWithWallet(
+  messageCV: ReturnType<typeof tupleCV>,
+  domainCV: ReturnType<typeof tupleCV>,
+  chainId: number,
+): Promise<{ signature: string; publicKey: string | null }> {
   const network = chainIdToNetworkName(chainId);
   let resp: unknown = null;
   let lastError: unknown = null;
@@ -567,11 +621,11 @@ async function sip018SignWithWallet(contractId: string, transferCV: ClarityValue
   // Preferred path: @stacks/connect request() normalizes wallet-specific quirks.
   try {
     resp = await stacksRequest('stx_signStructuredMessage', {
-      message: transferCV,
+      message: messageCV,
       domain: domainCV,
     });
     const sig = extractSignature(resp);
-    if (sig) return sig;
+    if (sig) return { signature: sig, publicKey: extractPublicKey(resp) };
   } catch (err) {
     lastError = err;
   }
@@ -586,11 +640,11 @@ async function sip018SignWithWallet(contractId: string, transferCV: ClarityValue
   try {
     resp = await provider.request('stx_signStructuredMessage', {
       network,
-      message: transferCV,
+      message: messageCV,
       domain: domainCV,
     });
     const sig = extractSignature(resp);
-    if (sig) return sig;
+    if (sig) return { signature: sig, publicKey: extractPublicKey(resp) };
   } catch (err) {
     lastError = err;
   }
@@ -599,11 +653,11 @@ async function sip018SignWithWallet(contractId: string, transferCV: ClarityValue
   try {
     resp = await provider.request('stx_signStructuredMessage', {
       network,
-      message: cvToWalletJson(transferCV),
+      message: cvToWalletJson(messageCV),
       domain: cvToWalletJson(domainCV),
     });
     const sig = extractSignature(resp);
-    if (sig) return sig;
+    if (sig) return { signature: sig, publicKey: extractPublicKey(resp) };
   } catch (err) {
     lastError = err;
   }
@@ -615,7 +669,7 @@ async function sip018SignWithWallet(contractId: string, transferCV: ClarityValue
     }
     throw lastError;
   }
-  throw new Error('Wallet returned no signature for payment proof');
+  throw new Error('Wallet returned no signature');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -918,11 +972,12 @@ async function loadInbox(): Promise<void> {
   const statusEl = document.getElementById('inbox-status') as HTMLElement;
   const claimed  = (document.getElementById('show-claimed-cb') as HTMLInputElement).checked;
 
-  statusEl.innerHTML = '<span class="spinner"></span> Loading…';
+  statusEl.innerHTML = '<span class="spinner"></span> Waiting for wallet signature…';
   listEl.innerHTML   = '';
 
   try {
     const auth = await buildWalletAuthHeader('get-inbox');
+    statusEl.innerHTML = '<span class="spinner"></span> Loading inbox…';
     const r    = await apiFetch(`/inbox?limit=50${claimed ? '&claimed=true' : ''}`, {
       headers: { 'x-stackmail-auth': auth },
     });

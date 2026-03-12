@@ -23,13 +23,13 @@ const { encryptMail, decryptMail, hashSecret } =
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const SERVER      = 'http://127.0.0.1:8800';
+const SERVER      = process.env.STACKMAIL_SERVER_URL ?? 'http://127.0.0.1:8800';
 // The reservoir contract is the on-chain counterparty for all agent taps.
 // Agents call create-tap on sm-reservoir (not fund-pipe on sm-stackflow directly).
-const RESERVOIR   = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir';
-const SF_CONTRACT = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow';
-const TOKEN       = 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token';
-const CHAIN_ID    = 1;
+const RESERVOIR   = process.env.STACKMAIL_RESERVOIR_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir';
+const SF_CONTRACT = process.env.STACKMAIL_SF_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow';
+const TOKEN       = process.env.STACKMAIL_TOKEN_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token';
+const CHAIN_ID    = Number.parseInt(process.env.STACKMAIL_CHAIN_ID ?? '1', 10);
 const MSG_PRICE   = 1000n;
 
 // ─── Address helpers ──────────────────────────────────────────────────────────
@@ -262,10 +262,10 @@ async function demo() {
   console.log('  Stackmail Demo — reservoir model');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
   console.log('Contracts:');
-  console.log('  sm-test-token : SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token');
-  console.log('  sm-stackflow  : SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow');
-  console.log('  sm-reservoir  : SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir');
-  console.log('  (server URL)  : http://127.0.0.1:8800\n');
+  console.log(`  sm-test-token : ${TOKEN}`);
+  console.log(`  sm-stackflow  : ${SF_CONTRACT}`);
+  console.log(`  sm-reservoir  : ${RESERVOIR}`);
+  console.log(`  (server URL)  : ${SERVER}\n`);
 
   const alice = genKeypair();
   const bob   = genKeypair();

@@ -23,13 +23,17 @@
  *   // Register your mailbox (one-time, receives your pubkey)
  *   await registerMailbox(kp.privHex);
  *
- *   // Send a message (requires a funded pipe state)
+ *   // Inspect your current tap state (tracked by the server when available,
+ *   // otherwise read from chain)
+ *   const tap = await getTapState(kp.privHex);
+ *
+ *   // Send a message (pipeState is optional if the tap can be resolved)
  *   const { messageId, newPipeState } = await sendMessage({
  *     to: recipientAddr,
  *     subject: 'Hello',
  *     body: 'World',
  *     privkeyHex: kp.privHex,
- *     pipeState: { serverBalance: 0n, myBalance: 100_000n, nonce: 0n },
+ *     pipeState: tap?.pipeState,
  *   });
  *
  *   // Check and claim new messages
@@ -43,12 +47,12 @@ import { secp256k1 } from '@noble/curves/secp256k1';
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 export const DEFAULTS = {
-  SERVER_URL:    'http://127.0.0.1:8800',
+  SERVER_URL:    process.env.STACKMAIL_SERVER_URL ?? 'http://127.0.0.1:8800',
   /** The reservoir contract IS the server's on-chain identity. Taps are opened to this address. */
-  RESERVOIR:     'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir',
-  SF_CONTRACT:   'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow',
-  TOKEN:         'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token',
-  CHAIN_ID:      1,
+  RESERVOIR:     process.env.STACKMAIL_RESERVOIR_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir',
+  SF_CONTRACT:   process.env.STACKMAIL_SF_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-stackflow',
+  TOKEN:         process.env.STACKMAIL_TOKEN_CONTRACT_ID ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token',
+  CHAIN_ID:      parseInt(process.env.STACKMAIL_CHAIN_ID ?? '1', 10),
   MESSAGE_PRICE: 1000n,
 } as const;
 
@@ -84,6 +88,26 @@ export interface DecryptedMessage {
   secret: string;
 }
 
+export interface ServerStatus {
+  ok: boolean;
+  serverAddress?: string;
+  signerAddress?: string;
+  reservoirContract?: string;
+  sfContract?: string;
+  messagePriceSats?: string;
+  minFeeSats?: string;
+  network?: string;
+  chainId?: number;
+  supportedToken?: string | null;
+}
+
+export interface ResolvedTapState {
+  pipeState: PipeState;
+  contractId: string;
+  token: string | null;
+  source: 'server' | 'on-chain';
+}
+
 export interface EncryptedMail {
   v: 1;
   epk: string;   // 33 bytes compressed pubkey hex
@@ -101,6 +125,10 @@ export interface MailPayload {
 // ─── c32 Address Helpers ──────────────────────────────────────────────────────
 
 const C32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+function isContractPrincipal(value: string): boolean {
+  return /^S[PT][0-9A-Z]{39}\.[a-zA-Z][a-zA-Z0-9-]{0,39}$/.test(value);
+}
 
 function c32encode(data: Buffer): string {
   let n = BigInt('0x' + data.toString('hex'));
@@ -130,6 +158,13 @@ function parseStxAddress(address: string): { version: number; hash160: Buffer } 
   const version = C32.indexOf(addr[1].toUpperCase());
   const decoded = c32DecodeFixed(addr.slice(2), 24);
   return { version, hash160: decoded.subarray(0, 20) };
+}
+
+function hash160ToStxAddress(hash160: Buffer, version: number): string {
+  const payload = Buffer.concat([Buffer.from([version]), hash160]);
+  const h1 = createHash('sha256').update(payload).digest();
+  const checksum = createHash('sha256').update(h1).digest().subarray(0, 4);
+  return 'S' + C32[version] + c32encode(Buffer.concat([hash160, checksum]));
 }
 
 /** Derive STX mainnet address from compressed secp256k1 pubkey (33 bytes hex). */
@@ -183,7 +218,7 @@ function toConsensusBuff(addr: string): Buffer {
   }
 }
 
-function canonicalPipeKey(token: string, addr1: string, addr2: string) {
+function canonicalPipeKey(token: string | null, addr1: string, addr2: string) {
   const p1 = toConsensusBuff(addr1);
   const p2 = toConsensusBuff(addr2);
   return Buffer.compare(p1, p2) < 0
@@ -254,6 +289,115 @@ function serializeClarityValue(cv: ClarityValue): Buffer {
   }
 }
 
+type DecodedClarityValue =
+  | { type: 'uint'; value: bigint }
+  | { type: 'principal'; value: string }
+  | { type: 'none' }
+  | { type: 'some'; value: DecodedClarityValue }
+  | { type: 'tuple'; fields: Record<string, DecodedClarityValue> };
+
+function readU32be(buf: Buffer, offset: number): number {
+  return buf.readUInt32BE(offset);
+}
+
+function readU128be(buf: Buffer, offset: number): bigint {
+  let value = 0n;
+  for (let i = offset; i < offset + 16; i++) {
+    value = (value << 8n) | BigInt(buf[i]);
+  }
+  return value;
+}
+
+function decodeClarityValue(
+  buf: Buffer,
+  offset = 0,
+): { value: DecodedClarityValue; nextOffset: number } {
+  const tag = buf[offset];
+  let cursor = offset + 1;
+
+  switch (tag) {
+    case 0x01:
+      return {
+        value: { type: 'uint', value: readU128be(buf, cursor) },
+        nextOffset: cursor + 16,
+      };
+    case 0x05: {
+      const version = buf[cursor];
+      const hash160 = buf.subarray(cursor + 1, cursor + 21);
+      return {
+        value: { type: 'principal', value: hash160ToStxAddress(hash160, version) },
+        nextOffset: cursor + 21,
+      };
+    }
+    case 0x06: {
+      const version = buf[cursor];
+      const hash160 = buf.subarray(cursor + 1, cursor + 21);
+      const nameLen = buf[cursor + 21];
+      const name = buf.subarray(cursor + 22, cursor + 22 + nameLen).toString('ascii');
+      return {
+        value: { type: 'principal', value: `${hash160ToStxAddress(hash160, version)}.${name}` },
+        nextOffset: cursor + 22 + nameLen,
+      };
+    }
+    case 0x09:
+      return { value: { type: 'none' }, nextOffset: cursor };
+    case 0x0a: {
+      const nested = decodeClarityValue(buf, cursor);
+      return { value: { type: 'some', value: nested.value }, nextOffset: nested.nextOffset };
+    }
+    case 0x0c: {
+      const entries = readU32be(buf, cursor);
+      cursor += 4;
+      const fields: Record<string, DecodedClarityValue> = {};
+      for (let i = 0; i < entries; i++) {
+        const nameLen = buf[cursor];
+        cursor += 1;
+        const name = buf.subarray(cursor, cursor + nameLen).toString('ascii');
+        cursor += nameLen;
+        const decoded = decodeClarityValue(buf, cursor);
+        fields[name] = decoded.value;
+        cursor = decoded.nextOffset;
+      }
+      return { value: { type: 'tuple', fields }, nextOffset: cursor };
+    }
+    default:
+      throw new Error(`Unsupported Clarity type tag: 0x${tag.toString(16)}`);
+  }
+}
+
+function decodeClarityHex(hex: string): DecodedClarityValue {
+  const bytes = Buffer.from(hex.replace(/^0x/, ''), 'hex');
+  const decoded = decodeClarityValue(bytes, 0);
+  return decoded.value;
+}
+
+function parseOptionalPrincipalHex(hex: string): string | null {
+  const decoded = decodeClarityHex(hex);
+  if (decoded.type === 'none') return null;
+  if (decoded.type === 'some' && decoded.value.type === 'principal') {
+    return decoded.value.value;
+  }
+  throw new Error('expected optional principal result');
+}
+
+function parsePipeResultHex(hex: string): { balance1: bigint; balance2: bigint; nonce: bigint } | null {
+  const decoded = decodeClarityHex(hex);
+  const tuple = decoded.type === 'some' ? decoded.value : decoded;
+  if (tuple.type === 'none') return null;
+  if (tuple.type !== 'tuple') return null;
+  const balance1 = tuple.fields['balance-1'];
+  const balance2 = tuple.fields['balance-2'];
+  const nonce = tuple.fields.nonce;
+  if (balance1?.type !== 'uint' || balance2?.type !== 'uint' || nonce?.type !== 'uint') {
+    return null;
+  }
+  return {
+    balance1: balance1.value,
+    balance2: balance2.value,
+    nonce: nonce.value,
+  };
+}
+
 // ─── SIP-018 signing ──────────────────────────────────────────────────────────
 
 const SIP018_PREFIX = Buffer.from('534950303138', 'hex'); // "SIP018"
@@ -275,7 +419,7 @@ function buildSip018Domain(contractId: string, chainId: number): ClarityValue {
 
 /** Build the SIP-018 TypedMessage for a StackFlow transfer state update. */
 function buildTransferMessage(state: {
-  pipeKey: { token: string; 'principal-1': string; 'principal-2': string };
+  pipeKey: { token: string | null; 'principal-1': string; 'principal-2': string };
   forPrincipal: string;
   myBalance: string;
   theirBalance: string;
@@ -420,6 +564,180 @@ async function http(
   return { status: r.status, ok: r.ok, data };
 }
 
+export async function getServerStatus(
+  serverUrl: string = DEFAULTS.SERVER_URL,
+): Promise<ServerStatus> {
+  const r = await http('GET', `${serverUrl}/status`);
+  if (!r.ok) {
+    throw new Error(`getServerStatus failed: ${r.status} ${JSON.stringify(r.data)}`);
+  }
+  return r.data as ServerStatus;
+}
+
+function resolveReservoirContract(status: ServerStatus): string {
+  const reservoir = typeof status.reservoirContract === 'string' ? status.reservoirContract.trim() : '';
+  if (isContractPrincipal(reservoir)) return reservoir;
+  const serverAddress = typeof status.serverAddress === 'string' ? status.serverAddress.trim() : '';
+  if (isContractPrincipal(serverAddress)) return serverAddress;
+  return DEFAULTS.RESERVOIR;
+}
+
+function resolveSfContract(status: ServerStatus, fallback?: string): string {
+  return status.sfContract?.trim() || fallback || DEFAULTS.SF_CONTRACT;
+}
+
+function resolveChainId(status: ServerStatus, fallback?: number): number {
+  return typeof status.chainId === 'number' ? status.chainId : (fallback ?? DEFAULTS.CHAIN_ID);
+}
+
+function resolveMessagePrice(status: ServerStatus, fallback?: bigint): bigint {
+  return status.messagePriceSats ? BigInt(status.messagePriceSats) : (fallback ?? DEFAULTS.MESSAGE_PRICE);
+}
+
+function hiroApiForChain(chainId: number): string {
+  return chainId === 1 ? 'https://api.mainnet.hiro.so' : 'https://api.testnet.hiro.so';
+}
+
+async function fetchSupportedToken(
+  reservoirContract: string,
+  chainId: number,
+): Promise<string | null> {
+  const [contractAddr, contractName] = reservoirContract.split('.');
+  const r = await http(
+    'GET',
+    `${hiroApiForChain(chainId)}/v2/data_var/${contractAddr}/${contractName}/supported-token`,
+  );
+  if (!r.ok) {
+    throw new Error(`fetchSupportedToken failed: ${r.status} ${JSON.stringify(r.data)}`);
+  }
+  const data = r.data as Record<string, unknown>;
+  const hex =
+    (typeof data.data === 'string' ? data.data : null)
+    ?? (typeof data.result === 'string' ? data.result : null)
+    ?? (typeof data.value === 'string' ? data.value : null)
+    ?? (typeof data.hex === 'string' ? data.hex : null);
+  if (!hex?.startsWith('0x')) {
+    throw new Error('fetchSupportedToken returned an unexpected response');
+  }
+  return parseOptionalPrincipalHex(hex);
+}
+
+async function resolveSupportedToken(
+  status: ServerStatus,
+  reservoirContract: string,
+  chainId: number,
+  explicitToken?: string | null,
+): Promise<string | null> {
+  if (explicitToken !== undefined) return explicitToken;
+  if (status.supportedToken !== undefined) return status.supportedToken ?? null;
+  return fetchSupportedToken(reservoirContract, chainId);
+}
+
+async function fetchTrackedTapState(
+  privkeyHex: string,
+  serverUrl: string,
+): Promise<ResolvedTapState | null> {
+  const kp = keypairFromPrivkey(privkeyHex);
+  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-inbox');
+  const r = await http('GET', `${serverUrl}/tap/state`, undefined, { 'x-stackmail-auth': auth });
+  if (r.status === 404) return null;
+  if (!r.ok) {
+    throw new Error(`fetchTrackedTapState failed: ${r.status} ${JSON.stringify(r.data)}`);
+  }
+
+  const data = r.data as {
+    tap?: {
+      contractId?: string;
+      token?: string | null;
+      serverBalance?: string;
+      myBalance?: string;
+      nonce?: string;
+    } | null;
+  };
+  if (!data.tap) return null;
+
+  return {
+    pipeState: {
+      serverBalance: BigInt(String(data.tap.serverBalance ?? '0')),
+      myBalance: BigInt(String(data.tap.myBalance ?? '0')),
+      nonce: BigInt(String(data.tap.nonce ?? '0')),
+    },
+    contractId: typeof data.tap.contractId === 'string' && data.tap.contractId
+      ? data.tap.contractId
+      : DEFAULTS.SF_CONTRACT,
+    token: typeof data.tap.token === 'string' ? data.tap.token : null,
+    source: 'server',
+  };
+}
+
+async function queryOnChainTapState(
+  address: string,
+  reservoirContract: string,
+  sfContract: string,
+  token: string | null,
+  chainId: number,
+): Promise<ResolvedTapState | null> {
+  const pipeKey = canonicalPipeKey(token, address, reservoirContract);
+  const [contractAddr, contractName] = sfContract.split('.');
+  const endpoint = `${hiroApiForChain(chainId)}/v2/contracts/call-read/${contractAddr}/${contractName}/get-pipe`;
+
+  const tokenArg = '0x' + serializeClarityValue(
+    token == null
+      ? { type: 'none' }
+      : { type: 'some', value: { type: 'principal', value: token } },
+  ).toString('hex');
+  const withArg = '0x' + serializeClarityValue({ type: 'principal', value: reservoirContract }).toString('hex');
+  const legacyPipeKeyArg = '0x' + serializeClarityValue({
+    type: 'tuple',
+    fields: {
+      'principal-1': { type: 'principal', value: pipeKey['principal-1'] },
+      'principal-2': { type: 'principal', value: pipeKey['principal-2'] },
+      token: token == null
+        ? { type: 'none' }
+        : { type: 'some', value: { type: 'principal', value: token } },
+    },
+  }).toString('hex');
+
+  let r = await http('POST', endpoint, { sender: address, arguments: [tokenArg, withArg] });
+  let payload = r.data as { okay?: boolean; result?: string };
+  if (!payload.okay) {
+    r = await http('POST', endpoint, { sender: address, arguments: [legacyPipeKeyArg] });
+    payload = r.data as { okay?: boolean; result?: string };
+  }
+
+  if (!r.ok || !payload.okay || typeof payload.result !== 'string') return null;
+  const parsed = parsePipeResultHex(payload.result);
+  if (!parsed) return null;
+
+  const isPrincipal1 = pipeKey['principal-1'] === address;
+  return {
+    pipeState: {
+      serverBalance: isPrincipal1 ? parsed.balance2 : parsed.balance1,
+      myBalance: isPrincipal1 ? parsed.balance1 : parsed.balance2,
+      nonce: parsed.nonce,
+    },
+    contractId: sfContract,
+    token,
+    source: 'on-chain',
+  };
+}
+
+export async function getTapState(
+  privkeyHex: string,
+  serverUrl: string = DEFAULTS.SERVER_URL,
+): Promise<ResolvedTapState | null> {
+  const status = await getServerStatus(serverUrl);
+  const reservoirContract = resolveReservoirContract(status);
+  const chainId = resolveChainId(status);
+  const tracked = await fetchTrackedTapState(privkeyHex, serverUrl);
+  if (tracked) return tracked;
+
+  const kp = keypairFromPrivkey(privkeyHex);
+  const sfContract = resolveSfContract(status);
+  const token = await resolveSupportedToken(status, reservoirContract, chainId);
+  return queryOnChainTapState(kp.addr, reservoirContract, sfContract, token, chainId);
+}
+
 // ─── Public Client API ────────────────────────────────────────────────────────
 
 /**
@@ -468,7 +786,9 @@ export async function getPaymentInfo(
  * @param subject      Message subject line
  * @param body         Message body text
  * @param privkeyHex   Your secp256k1 private key (32 bytes hex)
- * @param pipeState    Current state of your payment channel to the server
+ * @param pipeState    Current state of your payment channel to the server.
+ *                     Optional: if omitted, the client first asks the server
+ *                     for tracked state and then falls back to an on-chain read.
  *                     { serverBalance, myBalance, nonce }
  *                     For a fresh channel: { serverBalance: 0n, myBalance: <funded_amount>, nonce: 0n }
  * @param serverUrl    Mailbox server URL
@@ -482,31 +802,51 @@ export async function sendMessage({
   privkeyHex,
   pipeState,
   serverUrl = DEFAULTS.SERVER_URL,
-  sfContract = DEFAULTS.SF_CONTRACT,
-  token = DEFAULTS.TOKEN,
-  chainId = DEFAULTS.CHAIN_ID,
-  messagePrice = DEFAULTS.MESSAGE_PRICE,
+  sfContract,
+  token,
+  chainId,
+  messagePrice,
 }: {
   to: string;
   subject: string;
   body: string;
   privkeyHex: string;
-  pipeState: PipeState;
+  pipeState?: PipeState;
   serverUrl?: string;
   sfContract?: string;
-  token?: string;
+  token?: string | null;
   chainId?: number;
   messagePrice?: bigint;
 }): Promise<{ messageId: string; newPipeState: PipeState }> {
   const kp = keypairFromPrivkey(privkeyHex);
-  const serverAddr = DEFAULTS.RESERVOIR;  // pipe counterparty is the reservoir contract
+  const status = await getServerStatus(serverUrl);
+  const resolvedReservoir = resolveReservoirContract(status);
+  const resolvedSfContract = resolveSfContract(status, sfContract);
+  const resolvedChainId = resolveChainId(status, chainId);
+  const resolvedMessagePrice = resolveMessagePrice(status, messagePrice);
+  const resolvedToken = await resolveSupportedToken(status, resolvedReservoir, resolvedChainId, token);
 
-  if (pipeState.myBalance < messagePrice) {
-    throw new Error(`Insufficient channel balance: have ${pipeState.myBalance}, need ${messagePrice}`);
+  const activeTap = pipeState == null
+    ? await getTapState(privkeyHex, serverUrl)
+    : {
+        pipeState,
+        contractId: resolvedSfContract,
+        token: resolvedToken,
+        source: 'server' as const,
+      };
+  if (!activeTap) {
+    throw new Error('No tap found for this sender. Open and fund a mailbox tap before sending.');
+  }
+  const activeContractId = activeTap.contractId || resolvedSfContract;
+  if (activeTap.pipeState.myBalance < resolvedMessagePrice) {
+    throw new Error(
+      `Insufficient channel balance: have ${activeTap.pipeState.myBalance}, need ${resolvedMessagePrice}`,
+    );
   }
 
   // 1. Look up recipient's public key
   const payInfo = await getPaymentInfo(to, serverUrl);
+  const serverAddr = payInfo.serverAddress || resolvedReservoir;
 
   // 2. Generate HTLC secret and encrypt message body
   const secretHex = randomBytes(32).toString('hex');
@@ -514,10 +854,11 @@ export async function sendMessage({
   const encPayload = encryptMail({ v: 1, secret: secretHex, subject, body }, payInfo.recipientPublicKey);
 
   // 3. Compute new channel balances
-  const newServerBalance = pipeState.serverBalance + messagePrice;
-  const newMyBalance     = pipeState.myBalance - messagePrice;
-  const nextNonce        = pipeState.nonce + 1n;
-  const pipeKey          = canonicalPipeKey(token, kp.addr, serverAddr);
+  const currentPipeState = activeTap.pipeState;
+  const newServerBalance = currentPipeState.serverBalance + resolvedMessagePrice;
+  const newMyBalance     = currentPipeState.myBalance - resolvedMessagePrice;
+  const nextNonce        = currentPipeState.nonce + 1n;
+  const pipeKey          = canonicalPipeKey(activeTap.token, kp.addr, serverAddr);
 
   // 4. Build and sign the state update (from sender's perspective)
   const state = {
@@ -532,11 +873,11 @@ export async function sendMessage({
     validAfter: null,
   };
   const message = buildTransferMessage(state);
-  const sig = await sip018Sign(sfContract, message, privkeyHex, chainId);
+  const sig = await sip018Sign(activeContractId, message, privkeyHex, resolvedChainId);
 
   // 5. Encode payment proof (from server's perspective)
   const proof = {
-    contractId: sfContract,
+    contractId: activeContractId,
     pipeKey,
     forPrincipal: serverAddr,
     withPrincipal: kp.addr,

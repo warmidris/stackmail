@@ -1,6 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { secp256k1 } from '@noble/curves/secp256k1';
-import { principalCV, serializeCVBytes } from '@stacks/transactions';
+import { principalCV, serializeCVBytes, someCV, uintCV } from '@stacks/transactions';
 import { ReservoirService } from './reservoir.js';
 import { buildTransferMessage, sip018Sign, type TransferState } from './sip018.js';
 import { pubkeyToStxAddress } from './auth.js';
@@ -33,6 +33,16 @@ function pipeId(contractId: string, p1: string, p2: string): string {
 }
 
 describe('ReservoirService', () => {
+  const realFetch = globalThis.fetch;
+
+  afterEach(() => {
+    if (realFetch) {
+      vi.stubGlobal('fetch', realFetch);
+    } else {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('rejects payment verification when key is missing', async () => {
     const { default: Database } = await import('better-sqlite3');
     const db = new Database(':memory:');
@@ -99,6 +109,12 @@ describe('ReservoirService', () => {
       senderPriv,
       1,
     );
+
+    const somePipeHex = '0x' + Buffer.from(serializeCVBytes(someCV(uintCV(0)))).toString('hex');
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ okay: true, result: somePipeHex }),
+    })) as unknown as typeof fetch);
 
     const verified = await service.verifyIncomingPayment(JSON.stringify({
       contractId,
