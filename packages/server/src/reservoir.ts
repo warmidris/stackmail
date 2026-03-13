@@ -12,6 +12,8 @@ import type { PendingPayment } from './types.js';
 import type { RuntimeSettingsStore } from './settings.js';
 import { cvToValue, hexToCV, noneCV, principalCV, serializeCVBytes, someCV, uintCV } from '@stacks/transactions';
 import type { ClarityValue } from '@stacks/transactions';
+import { PostConditionMode, broadcastTransaction, bufferCV, makeContractCall } from '@stacks/transactions';
+import { createNetwork } from '@stacks/network';
 import { buildTransferMessage, sip018Sign, sip018Verify, type TransferState } from './sip018.js';
 
 export interface VerifiedPayment {
@@ -111,6 +113,14 @@ function chainIdToHiroApi(chainId: number): string {
   return chainId === 1 ? 'https://api.mainnet.hiro.so' : 'https://api.testnet.hiro.so';
 }
 
+function chainIdToStacksNetwork(chainId: number): 'mainnet' | 'testnet' {
+  return chainId === 1 ? 'mainnet' : 'testnet';
+}
+
+function hexToBytes(value: string): Uint8Array {
+  return Uint8Array.from(Buffer.from(value.replace(/^0x/, ''), 'hex'));
+}
+
 function parseUintFromReadOnlyResult(result: string): bigint {
   try {
     if (result.startsWith('0x')) {
@@ -197,6 +207,7 @@ export class ReservoirService {
   private readonly contractId: string;
   private readonly chainId: number;
   private readonly settings: RuntimeSettingsStore;
+  private readonly network: ReturnType<typeof createNetwork>;
 
   constructor(config: {
     db: DB;
@@ -216,6 +227,7 @@ export class ReservoirService {
     this.serverPrivateKey = config.serverPrivateKey;
     this.contractId = config.contractId;
     this.chainId = config.chainId;
+    this.network = createNetwork({ network: chainIdToStacksNetwork(config.chainId) });
     this.initTables();
   }
 
@@ -574,6 +586,16 @@ export class ReservoirService {
     return this.chooseLatestRow(
       this.getLatestPipeRowForPrincipals(contractId, principal1, principal2),
       this.getLatestPendingPipeRowForPrincipals(contractId, principal1, principal2),
+    );
+  }
+
+  private getEnforceablePipeRowForCounterparty(counterparty: string): PipeRow | null {
+    if (!this.contractId) return null;
+    const principals = canonicalPipePrincipals(this.serverAddress, counterparty);
+    return this.getLatestPipeRowForPrincipals(
+      this.contractId,
+      principals['principal-1'],
+      principals['principal-2'],
     );
   }
 
@@ -1675,5 +1697,100 @@ export class ReservoirService {
       },
     );
     this.deletePendingStatesAtOrBelowNonce(current.pipeId, args.nonce);
+  }
+
+  async submitDisputeForCounterparty(counterparty: string): Promise<{
+    txid: string;
+    nonce: string;
+    pipeId: string;
+  }> {
+    if (!this.serverPrivateKey) {
+      throw new ReservoirError(503, 'reservoir signing key unavailable', 'reservoir-key-missing');
+    }
+    if (!this.contractId) {
+      throw new ReservoirError(503, 'stackflow contract not configured', 'stackflow-contract-missing');
+    }
+
+    const row = this.getEnforceablePipeRowForCounterparty(counterparty);
+    if (!row) {
+      throw new ReservoirError(404, `no enforceable pipe state for ${counterparty}`, 'no-enforceable-pipe-state');
+    }
+
+    const pipeKey = JSON.parse(row.pipe_key_json) as {
+      'principal-1': string;
+      'principal-2': string;
+      token: string | null;
+    };
+    const withPrincipal = pipeKey['principal-1'] === this.serverAddress
+      ? pipeKey['principal-2']
+      : pipeKey['principal-1'];
+
+    if (!withPrincipal || withPrincipal !== counterparty) {
+      throw new ReservoirError(400, 'stored pipe state does not match the requested counterparty', 'invalid-pipe-state');
+    }
+
+    const mySignature = row.last_server_signature;
+    const theirSignature = row.last_counterparty_signature;
+    if (!mySignature || !theirSignature) {
+      throw new ReservoirError(409, 'stored pipe state is missing dispute signatures', 'missing-dispute-signatures');
+    }
+
+    const [contractAddress, contractName] = this.contractId.split('.');
+    if (!contractAddress || !contractName) {
+      throw new ReservoirError(503, 'stackflow contract not configured', 'stackflow-contract-missing');
+    }
+
+    const tokenArg = pipeKey.token
+      ? someCV(principalCV(pipeKey.token))
+      : noneCV();
+    const secretArg = row.enforceable_secret
+      ? someCV(bufferCV(hexToBytes(row.enforceable_secret)))
+      : noneCV();
+    const validAfterArg = row.last_valid_after
+      ? someCV(uintCV(BigInt(row.last_valid_after)))
+      : noneCV();
+
+    const tx = await makeContractCall({
+      network: this.network,
+      senderKey: this.serverPrivateKey,
+      contractAddress,
+      contractName,
+      functionName: 'dispute-closure-for',
+      functionArgs: [
+        principalCV(this.serverAddress),
+        tokenArg,
+        principalCV(withPrincipal),
+        uintCV(BigInt(row.server_balance)),
+        uintCV(BigInt(row.counterparty_balance)),
+        bufferCV(hexToBytes(mySignature)),
+        bufferCV(hexToBytes(theirSignature)),
+        uintCV(BigInt(row.nonce)),
+        uintCV(BigInt(row.last_action ?? '1')),
+        principalCV(row.last_actor ?? this.serverAddress),
+        secretArg,
+        validAfterArg,
+      ],
+      postConditionMode: PostConditionMode.Allow,
+      validateWithAbi: false,
+    });
+
+    const result = await broadcastTransaction({
+      transaction: tx,
+      network: this.network,
+    });
+
+    if ('reason' in result) {
+      throw new ReservoirError(
+        502,
+        `dispute broadcast failed: ${result.reason}${result.error ? ` (${result.error})` : ''}`,
+        'dispute-broadcast-failed',
+      );
+    }
+
+    return {
+      txid: result.txid,
+      nonce: row.nonce,
+      pipeId: row.pipe_id,
+    };
   }
 }

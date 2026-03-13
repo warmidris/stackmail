@@ -89,6 +89,14 @@ STACKMAIL_MAX_DEFERRED_PER_RECIPIENT=20
 STACKMAIL_MAX_DEFERRED_GLOBAL=200
 STACKMAIL_DEFERRED_MESSAGE_TTL_MS=86400000
 STACKMAIL_MAX_BORROW_PER_TAP=100000
+STACKMAIL_AUTH_AUDIENCE=https://stackmail.example.com
+STACKMAIL_ALLOWED_ORIGINS=https://stackmail.example.com
+STACKMAIL_RATE_LIMIT_WINDOW_MS=60000
+STACKMAIL_RATE_LIMIT_MAX=120
+STACKMAIL_RATE_LIMIT_AUTH_MAX=60
+STACKMAIL_RATE_LIMIT_SEND_MAX=20
+STACKMAIL_RATE_LIMIT_ADMIN_MAX=10
+STACKMAIL_ENABLE_BROWSER_DECRYPT_KEY=false
 ```
 
 Optional identity vars:
@@ -96,6 +104,12 @@ Optional identity vars:
 ```bash
 STACKMAIL_SERVER_PRIVATE_KEY=<32-byte-hex>
 STACKMAIL_SERVER_STX_ADDRESS=SP...
+```
+
+Optional webhook / watcher integration:
+
+```bash
+STACKMAIL_DISPUTE_WEBHOOK_TOKEN=<random-shared-secret>
 ```
 
 If the identity vars are omitted, the server generates a signer key once and persists it in the SQLite `meta` table. Do not rotate or discard that DB file unless you also plan to update the on-chain agent registration.
@@ -188,6 +202,13 @@ Recommended operating model:
 - treat env vars as boot defaults and disaster-recovery fallback
 - treat the DB as the live source of truth after startup
 - include the DB in regular backups because it now contains both signer identity and active runtime config
+
+## Auth, CORS, And Browser Decrypt
+
+- `STACKMAIL_AUTH_AUDIENCE` should be set to the production origin or another stable deployment identifier. Inbox auth payloads are rejected if the audience does not match.
+- `STACKMAIL_ALLOWED_ORIGINS` should list the exact web origins allowed to call the API cross-origin. Same-origin requests are always allowed.
+- `STACKMAIL_ENABLE_BROWSER_DECRYPT_KEY` should remain `false` for production until wallet-native human decrypt is ready.
+- `POST /hooks/dispute` is available for external close/dispute detection systems. Hiro Chainhook is the expected first integration point.
 
 ## Current Mainnet Reality
 

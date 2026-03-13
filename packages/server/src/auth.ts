@@ -47,6 +47,7 @@ export interface AuthPayload {
   action: string;
   address: string;    // STX address (SP...)
   timestamp: number;  // unix ms
+  audience?: string;
   messageId?: string;
 }
 
@@ -58,6 +59,14 @@ export interface AuthResult {
 export interface InboxSessionPayload {
   address: string;
   exp: number;
+}
+
+export function getAuthAudience(config: Config): string {
+  const configured = config.authAudience.trim();
+  if (configured) return configured;
+  if (config.reservoirContractId.trim()) return config.reservoirContractId.trim();
+  if (config.serverStxAddress.trim()) return config.serverStxAddress.trim();
+  return AUTH_DOMAIN;
 }
 
 /**
@@ -258,6 +267,11 @@ async function verifyLegacyAuth(
     throw new AuthError(401, 'auth timestamp expired', 'auth-expired');
   }
 
+  const expectedAudience = getAuthAudience(config);
+  if ((payload.audience ?? '') !== expectedAudience) {
+    throw new AuthError(401, 'auth audience mismatch', 'audience-mismatch');
+  }
+
   const derivedAddress = pubkeyToStxAddress(pubkey);
   if (derivedAddress !== payload.address) {
     const derivedTestnet = pubkeyToStxAddress(pubkey, true);
@@ -295,14 +309,19 @@ async function verifyWalletAuth(
   const timestamp = typeof tsRaw === 'bigint' ? Number(tsRaw) : Number(String(tsRaw ?? '0'));
   const msgIdRaw  = (message['messageId'] as { value?: unknown })?.value;
   const messageId = msgIdRaw != null ? String(msgIdRaw) : undefined;
+  const audience = String((message['audience'] as { value?: unknown })?.value ?? '');
 
-  if (!action || !address || !timestamp) {
+  if (!action || !address || !timestamp || !audience) {
     throw new AuthError(401, 'wallet auth message missing required fields', 'invalid-auth-payload');
   }
 
   const age = Date.now() - timestamp;
   if (age < 0 || age > config.authTimestampTtlMs) {
     throw new AuthError(401, 'auth timestamp expired', 'auth-expired');
+  }
+
+  if (audience !== getAuthAudience(config)) {
+    throw new AuthError(401, 'auth audience mismatch', 'audience-mismatch');
   }
 
   // Verify pubkey matches claimed address
@@ -324,6 +343,7 @@ async function verifyWalletAuth(
     action: action as AuthPayload['action'],
     address,
     timestamp,
+    audience,
     ...(messageId != null ? { messageId } : {}),
   };
   return { payload, pubkeyHex: pubkey };

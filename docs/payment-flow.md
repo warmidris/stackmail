@@ -204,6 +204,7 @@ Current operational assumption:
 - the server stores the latest dispute-relevant off-chain state
 - forced closures are not currently monitored automatically
 - any close event must be detected and disputed manually
+- the server now exposes `POST /hooks/dispute` so an external watcher can notify it when a close/dispute event is detected
 
 What the server currently retains for manual dispute handling:
 
@@ -274,7 +275,7 @@ Current rule:
 Recommended future work:
 
 - add a built-in polling watcher for StackFlow close/dispute events
-- optionally accept external callbacks as a wake-up hint, but not as the source of truth
+- external callbacks such as Hiro Chainhook should be treated as wake-up hints, not the only source of truth
 - track dispute submissions and watcher cursors in dedicated tables
 
 ## Recipient Signature After Claim

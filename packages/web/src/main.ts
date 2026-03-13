@@ -151,10 +151,20 @@ function connectedUserIsReservoirAdmin(): boolean {
   return walletAddress != null && walletAddress === getReservoirDeployerAddress();
 }
 
+function browserDecryptFallbackEnabled(): boolean {
+  return serverStatus.enableBrowserDecryptKey === true;
+}
+
 function updateAdminSectionVisibility(): void {
   const section = document.getElementById('admin-section') as HTMLElement | null;
   if (!section) return;
   section.style.display = connectedUserIsReservoirAdmin() ? '' : 'none';
+}
+
+function updateBrowserDecryptFallbackVisibility(): void {
+  const section = document.getElementById('decrypt-key-section') as HTMLElement | null;
+  if (!section) return;
+  section.style.display = browserDecryptFallbackEnabled() ? '' : 'none';
 }
 
 function extractRuntimeSettings(status: Record<string, unknown>): RuntimeSettingsPayload | null {
@@ -588,12 +598,24 @@ function updateDecryptKeyStatus(kind: 'info' | 'success' | 'warning' | 'error', 
 }
 
 function updateDecryptKeyUI(): void {
+  updateBrowserDecryptFallbackVisibility();
   const input = document.getElementById('decrypt-key-input') as HTMLInputElement | null;
   const saveBtn = document.getElementById('save-decrypt-key-btn') as HTMLButtonElement | null;
   const clearBtn = document.getElementById('clear-decrypt-key-btn') as HTMLButtonElement | null;
   if (!input || !saveBtn || !clearBtn) return;
 
+  if (!browserDecryptFallbackEnabled()) {
+    input.value = '';
+    saveBtn.disabled = true;
+    clearBtn.disabled = true;
+    updateDecryptKeyStatus('info', walletCryptoAvailable
+      ? 'Wallet-native decrypt is available.'
+      : 'Browser private-key decrypt is disabled on this server.');
+    return;
+  }
+
   clearBtn.disabled = !inboxDecryptPrivateKey;
+  saveBtn.disabled = false;
   if (inboxDecryptPrivateKey) {
     input.value = '';
     saveBtn.textContent = 'Replace Decrypt Key';
@@ -608,6 +630,10 @@ function updateDecryptKeyUI(): void {
 }
 
 function saveDecryptKey(): void {
+  if (!browserDecryptFallbackEnabled()) {
+    updateDecryptKeyStatus('warning', 'Browser private-key decrypt is disabled on this server.');
+    return;
+  }
   const input = document.getElementById('decrypt-key-input') as HTMLInputElement;
   const normalized = normalizePrivateKeyHex(input.value);
   if (!normalized) {
@@ -636,6 +662,12 @@ function clearDecryptKey(): void {
 }
 
 function restoreDecryptKeyFromSession(): void {
+  if (!browserDecryptFallbackEnabled()) {
+    sessionStorage.removeItem(DECRYPT_KEY_STORAGE_KEY);
+    inboxDecryptPrivateKey = null;
+    updateDecryptKeyUI();
+    return;
+  }
   const stored = sessionStorage.getItem(DECRYPT_KEY_STORAGE_KEY);
   if (!stored) {
     updateDecryptKeyUI();
@@ -747,6 +779,7 @@ async function connectWallet(): Promise<void> {
       : null;
 
     updateWalletUI();
+    await ensureServerStatusLoaded().catch(() => {});
     restoreDecryptKeyFromSession();
     await refreshWalletCryptoAvailability();
     await onWalletConnected();
@@ -849,11 +882,16 @@ async function buildWalletAuthHeader(action: string, messageId?: string): Promis
   const chainId    = (serverStatus.chainId as number | undefined)    ?? CHAIN_ID;
   const authDomain = (serverStatus.authDomain as string | undefined) ?? 'Stackmail';
   const sfVersion  = (serverStatus.sfVersion as string | undefined)  ?? '0.6.0';
+  const audience   = (serverStatus.authAudience as string | undefined)
+    ?? (serverStatus.reservoirContract as string | undefined)
+    ?? (serverStatus.serverAddress as string | undefined)
+    ?? 'Stackmail';
 
   const msgFields: Record<string, { type: string; value: string }> = {
     action:    { type: 'string-ascii', value: action },
     address:   { type: 'principal',   value: walletAddress! },
     timestamp: { type: 'uint',        value: String(ts) },
+    audience:  { type: 'string-ascii', value: audience },
     ...(messageId ? { messageId: { type: 'string-ascii', value: messageId } } : {}),
   };
 
@@ -866,6 +904,7 @@ async function buildWalletAuthHeader(action: string, messageId?: string): Promis
     action: stringAsciiCV(action),
     address: principalCV(walletAddress!),
     timestamp: uintCV(BigInt(ts)),
+    audience: stringAsciiCV(audience),
     ...(messageId ? { messageId: stringAsciiCV(messageId) } : {}),
   });
 
@@ -1823,6 +1862,9 @@ interface ClaimedMessageResponse {
 }
 
 function requireInboxDecryptKey(): string {
+  if (!browserDecryptFallbackEnabled()) {
+    throw new Error('Browser private-key decrypt is disabled on this server. Use wallet-native decrypt instead.');
+  }
   if (!inboxDecryptPrivateKey) {
     throw new Error('Load your inbox decrypt key first. The UI accepts 64-char hex or 66-char Stacks keys ending in 01.');
   }
@@ -1867,6 +1909,9 @@ async function decryptInboxPayload(payload: EncryptedMail): Promise<DecryptedMai
     }
   }
 
+  if (!browserDecryptFallbackEnabled()) {
+    throw new Error('Wallet-native decrypt is required on this server.');
+  }
   const privateKey = requireInboxDecryptKey();
   return decryptMail(payload, privateKey);
 }
@@ -1914,7 +1959,9 @@ function renderInboxMessages(messages: InboxMessage[]): void {
       ? '<span style="color:var(--muted)">Leather can decrypt this message with the connected wallet.</span>'
       : decryptReady
         ? '<span style="color:var(--muted)">Encrypted message ready to decrypt locally.</span>'
-        : '<span style="color:var(--yellow)">Load your inbox decrypt key to claim and open this message.</span>';
+        : browserDecryptFallbackEnabled()
+          ? '<span style="color:var(--yellow)">Load your inbox decrypt key to claim and open this message.</span>'
+          : '<span style="color:var(--yellow)">Wallet-native decrypt is required on this server.</span>';
     const opened = openedInboxMessages[msg.id];
     const messageError = inboxMessageErrors[msg.id];
     const subject = opened?.subject?.trim() ? opened.subject : '(no subject)';
@@ -2315,6 +2362,7 @@ async function loadStatus(): Promise<void> {
     }
     serverStatus = data;
     updateAdminSectionVisibility();
+    updateDecryptKeyUI();
     populateAdminSettingsForm(extractRuntimeSettings(data));
     dot.className    = data.ok ? 'dot green' : 'dot red';
     label.textContent = data.ok ? 'Stackmail Server — Online' : 'Server returned error';

@@ -33,6 +33,7 @@ function buildAuthHeader(opts: {
   pubkey: string;
   action: string;
   address: string;
+  audience?: string;
   timestamp?: number;
   messageId?: string;
   privateKey: ReturnType<typeof generateKeyPairSync>['privateKey'];
@@ -41,6 +42,7 @@ function buildAuthHeader(opts: {
     action: opts.action,
     address: opts.address,
     timestamp: opts.timestamp ?? Date.now(),
+    audience: opts.audience ?? 'SP123',
     ...(opts.messageId ? { messageId: opts.messageId } : {}),
   };
   const signature = signMessage(JSON.stringify(payload), opts.privateKey);
@@ -54,6 +56,7 @@ const testConfig: Config = {
   dbFile: ':memory:',
   maxEncryptedBytes: 65536,
   authTimestampTtlMs: 300_000,
+  authAudience: 'SP123',
   stackflowNodeUrl: '',
   serverStxAddress: 'SP123',
   serverPrivateKey: '',
@@ -70,6 +73,13 @@ const testConfig: Config = {
   deferredMessageTtlMs: 86_400_000,
   maxBorrowPerTap: '100000',
   inboxSessionTtlMs: 300_000,
+  allowedOrigins: [],
+  rateLimitWindowMs: 60_000,
+  rateLimitMax: 120,
+  rateLimitAuthMax: 60,
+  rateLimitSendMax: 20,
+  rateLimitAdminMax: 10,
+  enableBrowserDecryptKey: false,
 };
 
 /** Minimal in-memory MessageStore stub. */
@@ -177,6 +187,19 @@ describe('verifyInboxAuth', () => {
     const header = Buffer.from(JSON.stringify({ pubkey: compressedPubkeyHex, payload, signature })).toString('base64');
 
     await expect(verifyInboxAuth(header, testConfig, makeMockStore())).rejects.toThrow('auth payload missing required fields');
+  });
+
+  it('rejects audience mismatch', async () => {
+    const { privateKey, compressedPubkeyHex } = generateTestKeypair();
+    const address = pubkeyToStxAddress(compressedPubkeyHex);
+    const header = buildAuthHeader({
+      pubkey: compressedPubkeyHex,
+      action: 'get-inbox',
+      address,
+      audience: 'https://evil.example',
+      privateKey,
+    });
+    await expect(verifyInboxAuth(header, testConfig, makeMockStore())).rejects.toThrow('auth audience mismatch');
   });
 });
 

@@ -43,7 +43,8 @@ See [DESIGN.md](./DESIGN.md) for full architecture details.
   - borrow more liquidity and increase receive power
 - The UI reads live reservoir and StackFlow config from `/status` and verifies tap existence on-chain.
 - Inbox claiming in the web UI uses wallet signatures and can use wallet-native encrypt/decrypt when Leather exposes `stx_encryptMessage` / `stx_decryptMessage`.
-  - Until that wallet build exists, the local decrypt key loaded in-browser remains the fallback path.
+  - The browser private-key fallback is now behind the server-side `STACKMAIL_ENABLE_BROWSER_DECRYPT_KEY` flag and should stay off for real deployments.
+  - Until the wallet path is ready for humans, the local decrypt key loaded in-browser remains a dev/testing fallback only.
   - The fallback UI accepts both raw 32-byte hex private keys (`64` hex chars) and Stacks-exported 33-byte compressed private keys (`66` hex chars) with a trailing `01`.
   - The local key flow is now a compatibility fallback, not the intended long-term UX.
 
@@ -118,3 +119,15 @@ Current admin-managed settings:
 - max borrow offered per tap
 
 Env vars remain the startup defaults, but the DB is the live runtime source of truth after boot.
+
+## Security Posture
+
+- Inbox auth is now audience-bound. Set `STACKMAIL_AUTH_AUDIENCE` explicitly for production.
+- Browser CORS is restricted to same-origin plus any `STACKMAIL_ALLOWED_ORIGINS` entries.
+- The server has simple in-memory endpoint rate limits:
+  - `STACKMAIL_RATE_LIMIT_WINDOW_MS`
+  - `STACKMAIL_RATE_LIMIT_MAX`
+  - `STACKMAIL_RATE_LIMIT_AUTH_MAX`
+  - `STACKMAIL_RATE_LIMIT_SEND_MAX`
+  - `STACKMAIL_RATE_LIMIT_ADMIN_MAX`
+- `POST /hooks/dispute` can accept authenticated close/dispute notifications from an external watcher such as Hiro Chainhook. Set `STACKMAIL_DISPUTE_WEBHOOK_TOKEN` to enable it.

@@ -96,8 +96,13 @@ export interface IPaymentService {
     counterpartySignature?: string | null;
     serverSignature?: string | null;
   }): Promise<void>;
+  submitDisputeForCounterparty?(counterparty: string): Promise<{
+    txid: string;
+    nonce: string;
+    pipeId: string;
+  }>;
 }
-import { verifyInboxAuth, verifyInboxSessionToken, issueInboxSessionToken, pubkeyToStxAddress, AuthError, AUTH_DOMAIN } from './auth.js';
+import { verifyInboxAuth, verifyInboxSessionToken, issueInboxSessionToken, pubkeyToStxAddress, AuthError, AUTH_DOMAIN, getAuthAudience } from './auth.js';
 import { verifySecretHash } from '@stackmail/crypto';
 
 export function createMailServer(
@@ -111,9 +116,97 @@ export function createMailServer(
   const __filename = fileURLToPath(import.meta.url);
   const WEB_DIR = join(dirname(__filename), '..', 'web');
   const WEB_DIR_RESOLVED = resolve(WEB_DIR);
+  const rateLimitBuckets = new Map<string, { windowStart: number; count: number }>();
 
   function currentSettings(): RuntimeSettings {
     return settingsStore.get();
+  }
+
+  function getClientIp(req: IncomingMessage): string {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string' && forwarded.trim()) {
+      return forwarded.split(',')[0]?.trim() || 'unknown';
+    }
+    return req.socket.remoteAddress || 'unknown';
+  }
+
+  function rateLimitKey(category: string, req: IncomingMessage): string {
+    return `${category}:${getClientIp(req)}`;
+  }
+
+  function consumeRateLimit(key: string, max: number): { allowed: boolean; retryAfterSeconds: number } {
+    const now = Date.now();
+    const bucket = rateLimitBuckets.get(key);
+    if (!bucket || now - bucket.windowStart >= config.rateLimitWindowMs) {
+      rateLimitBuckets.set(key, { windowStart: now, count: 1 });
+      return { allowed: true, retryAfterSeconds: Math.ceil(config.rateLimitWindowMs / 1000) };
+    }
+    if (bucket.count >= max) {
+      const retryAfterMs = Math.max(1000, config.rateLimitWindowMs - (now - bucket.windowStart));
+      return { allowed: false, retryAfterSeconds: Math.ceil(retryAfterMs / 1000) };
+    }
+    bucket.count += 1;
+    return { allowed: true, retryAfterSeconds: Math.ceil((config.rateLimitWindowMs - (now - bucket.windowStart)) / 1000) };
+  }
+
+  function rateLimitCategory(path: string): { category: string; max: number } | null {
+    if (path === '/health' || path === '/status' || path === '/' || path === '/ui' || path.startsWith('/assets/')) {
+      return null;
+    }
+    if (path.startsWith('/admin/')) {
+      return { category: 'admin', max: config.rateLimitAdminMax };
+    }
+    if (path === '/hooks/dispute') {
+      return { category: 'hook', max: config.rateLimitAdminMax };
+    }
+    if (path.startsWith('/messages/')) {
+      return { category: 'send', max: config.rateLimitSendMax };
+    }
+    if (path === '/inbox' || path.startsWith('/inbox/') || path === '/tap/state' || path.startsWith('/tap/')) {
+      return { category: 'auth', max: config.rateLimitAuthMax };
+    }
+    return { category: 'default', max: config.rateLimitMax };
+  }
+
+  function isAllowedOrigin(origin: string, url: URL): boolean {
+    if (origin === `${url.protocol}//${url.host}`) return true;
+    return config.allowedOrigins.includes(origin);
+  }
+
+  function applyCors(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
+    const origin = req.headers.origin;
+    if (!origin) return true;
+    if (!isAllowedOrigin(origin, url)) {
+      if ((req.method?.toUpperCase() ?? 'GET') === 'OPTIONS') {
+        json(res, 403, { error: 'origin-not-allowed' });
+        return false;
+      }
+      json(res, 403, { error: 'origin-not-allowed' });
+      return false;
+    }
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Headers', 'content-type, authorization, x-stackmail-auth, x-stackmail-session, x-stackmail-payment, x-x402-payment, x-stackmail-webhook-token');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Expose-Headers', 'x-stackmail-session, x-stackmail-session-expires-at');
+    return true;
+  }
+
+  function extractWebhookCounterparty(payload: Record<string, unknown>): string | null {
+    const candidates = [
+      payload['counterparty'],
+      payload['address'],
+      payload['wallet'],
+      payload['sender'],
+      payload['recipient'],
+      payload['senderAddress'],
+      payload['recipientAddress'],
+      payload['counterpartyAddress'],
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && /^S[PT][0-9A-Z]{39}$/.test(candidate)) return candidate;
+    }
+    return null;
   }
 
   function respondTypedServiceError(res: ServerResponse, err: unknown): boolean {
@@ -187,6 +280,10 @@ export function createMailServer(
         config,
         store,
       );
+      if (auth.payload.action !== 'admin-settings') {
+        json(res, 403, { error: 'auth-action-mismatch', message: 'expected action admin-settings' });
+        return null;
+      }
       const adminAddress = reservoirAdminAddress();
       if (!adminAddress || auth.payload.address !== adminAddress) {
         json(res, 403, { error: 'admin-required', message: 'Only the reservoir deployer may update runtime settings' });
@@ -243,6 +340,63 @@ export function createMailServer(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return json(res, 400, { error: 'invalid-runtime-settings', message });
+    }
+  }
+
+  async function handleDisputeWebhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!config.disputeWebhookToken) {
+      return json(res, 503, { error: 'dispute-webhook-disabled' });
+    }
+    const tokenHeader = req.headers['x-stackmail-webhook-token'];
+    const authHeader = req.headers.authorization;
+    const token = typeof tokenHeader === 'string'
+      ? tokenHeader
+      : (typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '');
+    if (!token || token !== config.disputeWebhookToken) {
+      return json(res, 401, { error: 'invalid-webhook-token' });
+    }
+
+    let body: string;
+    try {
+      body = await readBody(req, 65_536);
+    } catch {
+      return json(res, 413, { error: 'body-too-large' });
+    }
+
+    let payload: Record<string, unknown>;
+    try {
+      payload = body ? JSON.parse(body) as Record<string, unknown> : {};
+    } catch {
+      return json(res, 400, { error: 'invalid-json' });
+    }
+
+    const counterparty = extractWebhookCounterparty(payload);
+    if (!counterparty) {
+      return json(res, 400, { error: 'missing-counterparty' });
+    }
+    if (typeof paymentService.submitDisputeForCounterparty !== 'function') {
+      return json(res, 503, { error: 'dispute-submission-unavailable' });
+    }
+
+    console.warn('[stackmail] dispute webhook received', {
+      counterparty,
+      event: typeof payload['event'] === 'string' ? payload['event'] : null,
+      txid: typeof payload['txid'] === 'string' ? payload['txid'] : null,
+    });
+
+    try {
+      const submitted = await paymentService.submitDisputeForCounterparty(counterparty);
+      return json(res, 200, {
+        ok: true,
+        counterparty,
+        submitted: true,
+        txid: submitted.txid,
+        nonce: submitted.nonce,
+        pipeId: submitted.pipeId,
+      });
+    } catch (err) {
+      if (respondTypedServiceError(res, err)) return;
+      throw err;
     }
   }
 
@@ -866,12 +1020,18 @@ export function createMailServer(
     const method = req.method?.toUpperCase() ?? 'GET';
     const path = url.pathname;
 
-    // CORS for web UI
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'content-type, x-stackmail-auth, x-stackmail-session, x-stackmail-payment, x-x402-payment');
-    res.setHeader('Access-Control-Expose-Headers', 'x-stackmail-session, x-stackmail-session-expires-at');
+    if (!applyCors(req, res, url)) return;
     if (method === 'OPTIONS') {
       res.writeHead(204); res.end(); return;
+    }
+
+    const limit = rateLimitCategory(path);
+    if (limit) {
+      const verdict = consumeRateLimit(rateLimitKey(limit.category, req), limit.max);
+      if (!verdict.allowed) {
+        res.setHeader('Retry-After', String(verdict.retryAfterSeconds));
+        return json(res, 429, { error: 'rate-limit-exceeded', category: limit.category });
+      }
     }
 
     if (method === 'GET' && path === '/health') {
@@ -893,8 +1053,14 @@ export function createMailServer(
         network: config.chainId === 1 ? 'mainnet' : 'testnet',
         chainId: config.chainId,
         authDomain: AUTH_DOMAIN,
+        authAudience: getAuthAudience(config),
+        enableBrowserDecryptKey: config.enableBrowserDecryptKey,
         sfVersion: '0.6.0',
       });
+    }
+
+    if (method === 'POST' && path === '/hooks/dispute') {
+      return handleDisputeWebhook(req, res);
     }
 
     if (method === 'GET' && path === '/tap/state') {

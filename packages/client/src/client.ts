@@ -54,6 +54,7 @@ export class StackmailClient {
   private readonly config: ClientConfig;
   private inboxSessionToken: string | null = null;
   private inboxSessionExpiresAt = 0;
+  private authAudience: string | null = null;
 
   constructor(config: ClientConfig) {
     this.config = config;
@@ -523,15 +524,26 @@ export class StackmailClient {
     action: 'get-inbox' | 'claim-message' | 'get-message',
     messageId?: string,
   ): Promise<string> {
+    const audience = await this.getAuthAudience();
     const payload = {
       action,
       address: this.config.address,
       timestamp: Date.now(),
+      audience,
       ...(messageId ? { messageId } : {}),
     };
     const message = JSON.stringify(payload);
     const signature = await this.config.signer(message);
     return Buffer.from(JSON.stringify({ pubkey: this.config.publicKey, payload, signature })).toString('base64');
+  }
+
+  private async getAuthAudience(): Promise<string> {
+    if (this.authAudience) return this.authAudience;
+    const res = await fetch(`${this.config.serverUrl}/status`, { signal: AbortSignal.timeout(10_000) });
+    const data = await res.json().catch(() => ({})) as Record<string, unknown>;
+    if (!res.ok) throw new StackmailError(res.status, String(data['error'] ?? 'status-failed'), data);
+    this.authAudience = String(data['authAudience'] ?? data['serverAddress'] ?? 'Stackmail');
+    return this.authAudience;
   }
 
   private async buildInboxHeaders(

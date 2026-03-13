@@ -8,6 +8,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { randomBytes, generateKeyPairSync, createSign, createECDH } from 'node:crypto';
 import { AddressInfo } from 'node:net';
+import { request as httpRequest } from 'node:http';
 import { createMailServer, type IPaymentService } from './app.js';
 import { SqliteMessageStore } from './store.js';
 import { pubkeyToStxAddress } from './auth.js';
@@ -26,6 +27,7 @@ class MockPaymentService implements IPaymentService {
   outgoingPaymentEnabled = true;
   completedIncomingPayments: Array<{ paymentProof: string; secret: string }> = [];
   cancelledMessages: Array<{ paymentProof: string; senderAddr: string; recipientAddr: string; incomingAmount: string; fee: string }> = [];
+  submittedDisputes: Array<string> = [];
 
   async verifyIncomingPayment(proofRaw: string): Promise<VerifiedPayment> {
     let proof: Record<string, unknown>;
@@ -128,6 +130,15 @@ class MockPaymentService implements IPaymentService {
       fee: args.fee,
     });
   }
+
+  async submitDisputeForCounterparty(counterparty: string): Promise<{ txid: string; nonce: string; pipeId: string }> {
+    this.submittedDisputes.push(counterparty);
+    return {
+      txid: '0xdispute',
+      nonce: this.trackedTapState?.nonce ?? '0',
+      pipeId: 'mock-pipe',
+    };
+  }
 }
 
 // ─── Test keypair helpers ─────────────────────────────────────────────────────
@@ -153,6 +164,7 @@ function buildAuthHeader(opts: {
   pubkey: string;
   action: string;
   address: string;
+  audience?: string;
   messageId?: string;
   privateKey: ReturnType<typeof generateKeyPairSync>['privateKey'];
 }): string {
@@ -160,10 +172,44 @@ function buildAuthHeader(opts: {
     action: opts.action,
     address: opts.address,
     timestamp: Date.now(),
+    audience: opts.audience ?? 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir',
     ...(opts.messageId ? { messageId: opts.messageId } : {}),
   };
   const signature = signMessage(JSON.stringify(payload), opts.privateKey);
   return Buffer.from(JSON.stringify({ pubkey: opts.pubkey, payload, signature })).toString('base64');
+}
+
+async function rawJsonRequest(url: string, init: {
+  method: string;
+  headers?: Record<string, string>;
+  body?: string;
+}): Promise<{ status: number; body: unknown }> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const req = httpRequest({
+      hostname: target.hostname,
+      port: target.port,
+      path: `${target.pathname}${target.search}`,
+      method: init.method,
+      headers: init.headers,
+    }, res => {
+      const chunks: Buffer[] = [];
+      res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf-8');
+        let body: unknown = text;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          // keep raw body
+        }
+        resolve({ status: res.statusCode ?? 0, body });
+      });
+    });
+    req.on('error', reject);
+    if (init.body) req.write(init.body);
+    req.end();
+  });
 }
 
 // ─── Test setup ───────────────────────────────────────────────────────────────
@@ -186,6 +232,7 @@ const serverConfig: Config = {
   dbFile: ':memory:',
   maxEncryptedBytes: 65536,
   authTimestampTtlMs: 300_000,
+  authAudience: 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-reservoir',
   stackflowNodeUrl: '',
   serverStxAddress: 'SP_SERVER',
   serverPrivateKey: '',
@@ -202,6 +249,13 @@ const serverConfig: Config = {
   deferredMessageTtlMs: 86_400_000,
   maxBorrowPerTap: '100000',
   inboxSessionTtlMs: 300_000,
+  allowedOrigins: [],
+  rateLimitWindowMs: 60_000,
+  rateLimitMax: 120,
+  rateLimitAuthMax: 60,
+  rateLimitSendMax: 20,
+  rateLimitAdminMax: 10,
+  enableBrowserDecryptKey: false,
 };
 
 let server: Server;
@@ -992,5 +1046,85 @@ describe('per-sender HTLC cap', () => {
     expect(body.error).toBe('recipient-inbox-full');
 
     await new Promise<void>((r, j) => capServer.close(e => e ? j(e) : r()));
+  });
+});
+
+describe('security hardening', () => {
+  it('reports auth audience and browser decrypt policy in /status', async () => {
+    const res = await fetch(`${baseUrl}/status`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { authAudience?: string; enableBrowserDecryptKey?: boolean };
+    expect(body.authAudience).toBe(serverConfig.authAudience);
+    expect(body.enableBrowserDecryptKey).toBe(false);
+  });
+
+  it('rejects disallowed browser origins', async () => {
+    const res = await fetch(`${baseUrl}/status`, {
+      headers: { origin: 'https://evil.example' },
+    });
+    expect(res.status).toBe(403);
+    const body = await res.json() as { error?: string };
+    expect(body.error).toBe('origin-not-allowed');
+  });
+
+  it('accepts dispute webhooks only with the configured token', async () => {
+    const hookStore = new SqliteMessageStore(':memory:');
+    await hookStore.init();
+    const hookService = new MockPaymentService();
+    hookService.trackedTapState = {
+      contractId: serverConfig.sfContractId,
+      pipeKey: {
+        'principal-1': recipientAddress,
+        'principal-2': serverConfig.reservoirContractId,
+        token: 'SP3QFYVTMS0PRJT3K3GMDW9DGR33TDHENSDWVNQMR.sm-test-token',
+      },
+      serverBalance: '100',
+      counterpartyBalance: '900',
+      nonce: '7',
+    };
+    const hookConfig: Config = {
+      ...serverConfig,
+      disputeWebhookToken: 'hook-secret',
+    };
+    const { default: Database } = await import('better-sqlite3');
+    const hookDb = new Database(':memory:');
+    const hookSettings = new RuntimeSettingsStore(hookDb, runtimeSettingsFromConfig(hookConfig));
+    const hookServer = createMailServer(hookConfig, hookStore, hookService, hookSettings);
+    await new Promise<void>(r => hookServer.listen(0, '127.0.0.1', () => r()));
+    const hookUrl = `http://127.0.0.1:${(hookServer.address() as AddressInfo).port}`;
+
+    const unauthorized = await rawJsonRequest(`${hookUrl}/hooks/dispute`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ counterparty: recipientAddress }),
+    });
+    expect(unauthorized.status).toBe(401);
+
+    const authorized = await rawJsonRequest(`${hookUrl}/hooks/dispute`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-stackmail-webhook-token': 'hook-secret',
+      },
+      body: JSON.stringify({ event: 'force-close-detected', counterparty: recipientAddress }),
+    });
+    expect(authorized.status).toBe(200);
+    const body = authorized.body as {
+      ok?: boolean;
+      submitted?: boolean;
+      counterparty?: string;
+      txid?: string;
+      nonce?: string;
+      pipeId?: string;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.submitted).toBe(true);
+    expect(body.counterparty).toBe(recipientAddress);
+    expect(body.txid).toBe('0xdispute');
+    expect(body.nonce).toBe('7');
+    expect(body.pipeId).toBe('mock-pipe');
+    expect(hookService.submittedDisputes).toEqual([recipientAddress]);
+
+    await new Promise<void>((r, j) => hookServer.close(e => e ? j(e) : r()));
   });
 });

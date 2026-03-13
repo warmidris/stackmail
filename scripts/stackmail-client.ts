@@ -99,6 +99,7 @@ export interface ServerStatus {
   network?: string;
   chainId?: number;
   supportedToken?: string | null;
+  authAudience?: string;
   runtimeSettings?: {
     maxBorrowPerTap?: string;
   };
@@ -553,9 +554,10 @@ function buildAuthHeader(
   pubHex: string,
   addr: string,
   action: 'get-inbox' | 'get-message' | 'claim-message',
+  audience: string,
   messageId?: string,
 ): string {
-  const payload = { action, address: addr, timestamp: Date.now(), ...(messageId ? { messageId } : {}) };
+  const payload = { action, address: addr, timestamp: Date.now(), audience, ...(messageId ? { messageId } : {}) };
   const hash = sha256(Buffer.from(JSON.stringify(payload)));
   const sig = secp256k1.sign(hash, Buffer.from(privHex, 'hex'), { lowS: true });
   const sigHex = Buffer.from(sig.toCompactRawBytes()).toString('hex');
@@ -612,6 +614,16 @@ function resolveMessagePrice(status: ServerStatus, fallback?: bigint): bigint {
   return status.messagePriceSats ? BigInt(status.messagePriceSats) : (fallback ?? DEFAULTS.MESSAGE_PRICE);
 }
 
+function resolveAuthAudience(status: ServerStatus): string {
+  const audience = typeof status.authAudience === 'string' ? status.authAudience.trim() : '';
+  if (audience) return audience;
+  const reservoir = typeof status.reservoirContract === 'string' ? status.reservoirContract.trim() : '';
+  if (reservoir) return reservoir;
+  const serverAddress = typeof status.serverAddress === 'string' ? status.serverAddress.trim() : '';
+  if (serverAddress) return serverAddress;
+  return 'Stackmail';
+}
+
 function hiroApiForChain(chainId: number): string {
   return chainId === 1 ? 'https://api.mainnet.hiro.so' : 'https://api.testnet.hiro.so';
 }
@@ -656,7 +668,8 @@ async function fetchTrackedTapState(
   serverUrl: string,
 ): Promise<ResolvedTapState | null> {
   const kp = keypairFromPrivkey(privkeyHex);
-  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-inbox');
+  const status = await getServerStatus(serverUrl);
+  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-inbox', resolveAuthAudience(status));
   const r = await http('GET', `${serverUrl}/tap/state`, undefined, { 'x-stackmail-auth': auth });
   if (r.status === 404) return null;
   if (!r.ok) {
@@ -884,7 +897,8 @@ export async function syncTapState(
   serverUrl: string = DEFAULTS.SERVER_URL,
 ): Promise<void> {
   const kp = keypairFromPrivkey(privkeyHex);
-  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-inbox');
+  const status = await getServerStatus(serverUrl);
+  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-inbox', resolveAuthAudience(status));
   const actor = action.functionName === 'add-funds' ? kp.addr : action.reservoirContract;
   const r = await http(
     'POST',
@@ -920,7 +934,8 @@ export async function registerMailbox(
   serverUrl: string = DEFAULTS.SERVER_URL,
 ): Promise<{ address: string }> {
   const kp = keypairFromPrivkey(privkeyHex);
-  const authHeader = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-inbox');
+  const status = await getServerStatus(serverUrl);
+  const authHeader = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-inbox', resolveAuthAudience(status));
   const r = await http('GET', `${serverUrl}/inbox`, undefined, { 'x-stackmail-auth': authHeader });
   if (r.status !== 200 && r.status !== 404) {
     throw new Error(`registerMailbox failed: ${r.status} ${JSON.stringify(r.data)}`);
@@ -1087,7 +1102,8 @@ export async function getInbox(
   includeClaimed = false,
 ): Promise<InboxEntry[]> {
   const kp = keypairFromPrivkey(privkeyHex);
-  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-inbox');
+  const status = await getServerStatus(serverUrl);
+  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-inbox', resolveAuthAudience(status));
   const url = `${serverUrl}/inbox${includeClaimed ? '?claimed=true' : ''}`;
   const r = await http('GET', url, undefined, { 'x-stackmail-auth': auth });
   if (!r.ok) throw new Error(`getInbox failed: ${r.status} ${JSON.stringify(r.data)}`);
@@ -1104,7 +1120,8 @@ export async function previewMessage(
   serverUrl: string = DEFAULTS.SERVER_URL,
 ): Promise<{ from: string; sentAt: number; amount: string; encryptedPayload: EncryptedMail; hashedSecret: string }> {
   const kp = keypairFromPrivkey(privkeyHex);
-  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-message', messageId);
+  const status = await getServerStatus(serverUrl);
+  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'get-message', resolveAuthAudience(status), messageId);
   const r = await http('GET', `${serverUrl}/inbox/${messageId}/preview`, undefined, { 'x-stackmail-auth': auth });
   if (!r.ok) throw new Error(`previewMessage failed: ${r.status} ${JSON.stringify(r.data)}`);
   return r.data as Awaited<ReturnType<typeof previewMessage>>;
@@ -1145,7 +1162,8 @@ export async function claimMessage(
   }
 
   // Reveal the secret to claim the payment
-  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'claim-message', messageId);
+  const status = await getServerStatus(serverUrl);
+  const auth = buildAuthHeader(kp.privHex, kp.pubHex, kp.addr, 'claim-message', resolveAuthAudience(status), messageId);
   const r = await http(
     'POST',
     `${serverUrl}/inbox/${messageId}/claim`,

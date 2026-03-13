@@ -10,6 +10,7 @@ const baseConfig: Config = {
   dbFile: ':memory:',
   maxEncryptedBytes: 65536,
   authTimestampTtlMs: 300_000,
+  authAudience: 'SP123',
   stackflowNodeUrl: '',
   serverStxAddress: 'SP123',
   serverPrivateKey: '',
@@ -26,6 +27,13 @@ const baseConfig: Config = {
   deferredMessageTtlMs: 86_400_000,
   maxBorrowPerTap: '100000',
   inboxSessionTtlMs: 300_000,
+  allowedOrigins: [],
+  rateLimitWindowMs: 60_000,
+  rateLimitMax: 120,
+  rateLimitAuthMax: 60,
+  rateLimitSendMax: 20,
+  rateLimitAdminMax: 10,
+  enableBrowserDecryptKey: false,
 };
 
 describe('RuntimeSettingsStore', () => {

@@ -117,6 +117,7 @@ export interface Config {
   dbUrl?: string;
   maxEncryptedBytes: number;
   authTimestampTtlMs: number;
+  authAudience: string;
   /** @deprecated kept for payment-info response compatibility */
   stackflowNodeUrl: string;
   /** Standard principal used to verify server signatures (derived from private key by default) */
@@ -148,6 +149,14 @@ export interface Config {
   /** Max additional receive liquidity the server will offer to a single tap */
   maxBorrowPerTap: string;
   inboxSessionTtlMs: number;
+  allowedOrigins: string[];
+  rateLimitWindowMs: number;
+  rateLimitMax: number;
+  rateLimitAuthMax: number;
+  rateLimitSendMax: number;
+  rateLimitAdminMax: number;
+  enableBrowserDecryptKey: boolean;
+  disputeWebhookToken?: string;
 }
 
 export interface RuntimeSettings {
@@ -198,6 +207,7 @@ export function loadConfig(): Config {
     dbUrl: process.env.STACKMAIL_DB_URL,
     maxEncryptedBytes: parseInt(process.env.STACKMAIL_MAX_ENCRYPTED_BYTES ?? '65536', 10),
     authTimestampTtlMs: parseInt(process.env.STACKMAIL_AUTH_TIMESTAMP_TTL_MS ?? '300000', 10),
+    authAudience: process.env.STACKMAIL_AUTH_AUDIENCE ?? '',
     stackflowNodeUrl: process.env.STACKMAIL_STACKFLOW_NODE_URL ?? '',
     serverStxAddress: process.env.STACKMAIL_SERVER_STX_ADDRESS ?? '',
     serverPrivateKey: process.env.STACKMAIL_SERVER_PRIVATE_KEY ?? '',
@@ -214,5 +224,16 @@ export function loadConfig(): Config {
     deferredMessageTtlMs: parseInt(process.env.STACKMAIL_DEFERRED_MESSAGE_TTL_MS ?? '86400000', 10),
     maxBorrowPerTap: process.env.STACKMAIL_MAX_BORROW_PER_TAP ?? '100000',
     inboxSessionTtlMs: parseInt(process.env.STACKMAIL_INBOX_SESSION_TTL_MS ?? '300000', 10),
+    allowedOrigins: (process.env.STACKMAIL_ALLOWED_ORIGINS ?? '')
+      .split(',')
+      .map(value => value.trim())
+      .filter(Boolean),
+    rateLimitWindowMs: parseInt(process.env.STACKMAIL_RATE_LIMIT_WINDOW_MS ?? '60000', 10),
+    rateLimitMax: parseInt(process.env.STACKMAIL_RATE_LIMIT_MAX ?? '120', 10),
+    rateLimitAuthMax: parseInt(process.env.STACKMAIL_RATE_LIMIT_AUTH_MAX ?? '60', 10),
+    rateLimitSendMax: parseInt(process.env.STACKMAIL_RATE_LIMIT_SEND_MAX ?? '20', 10),
+    rateLimitAdminMax: parseInt(process.env.STACKMAIL_RATE_LIMIT_ADMIN_MAX ?? '10', 10),
+    enableBrowserDecryptKey: (process.env.STACKMAIL_ENABLE_BROWSER_DECRYPT_KEY ?? 'false').toLowerCase() === 'true',
+    disputeWebhookToken: process.env.STACKMAIL_DISPUTE_WEBHOOK_TOKEN,
   };
 }
