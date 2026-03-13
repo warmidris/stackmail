@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import readline from 'node:readline/promises';
+import readline from 'node:readline';
+import readlinePromises from 'node:readline/promises';
 
 const stackmailModule = await import('./stackmail-client.ts');
 const stackmail = stackmailModule.default ?? stackmailModule;
@@ -121,7 +122,7 @@ function clearScreen() {
 }
 
 async function prompt(question, initial = '') {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const rl = readlinePromises.createInterface({ input: process.stdin, output: process.stdout });
   try {
     const suffix = initial ? ` [${initial}]` : '';
     const answer = await rl.question(`${question}${suffix}: `);
@@ -132,7 +133,7 @@ async function prompt(question, initial = '') {
 }
 
 async function pause(message = 'Press Enter to continue') {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const rl = readlinePromises.createInterface({ input: process.stdin, output: process.stdout });
   try {
     await rl.question(`${message}`);
   } finally {
@@ -147,16 +148,16 @@ async function promptBody(initial = '') {
     console.log(initial);
     console.log('---');
   }
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const promptRl = readlinePromises.createInterface({ input: process.stdin, output: process.stdout });
   const lines = [];
   try {
     while (true) {
-      const line = await rl.question('');
+      const line = await promptRl.question('');
       if (line === '.') break;
       lines.push(line);
     }
   } finally {
-    rl.close();
+    promptRl.close();
   }
   const body = lines.join('\n').trim();
   if (!body && initial) return initial;
