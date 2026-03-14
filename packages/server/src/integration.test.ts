@@ -248,6 +248,7 @@ const serverConfig: Config = {
   maxDeferredGlobal: 200,
   deferredMessageTtlMs: 86_400_000,
   maxBorrowPerTap: '100000',
+  refreshCapacityCooldownMs: 86_400_000,
   inboxSessionTtlMs: 300_000,
   allowedOrigins: [],
   rateLimitWindowMs: 60_000,

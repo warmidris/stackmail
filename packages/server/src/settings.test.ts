@@ -26,6 +26,7 @@ const baseConfig: Config = {
   maxDeferredGlobal: 200,
   deferredMessageTtlMs: 86_400_000,
   maxBorrowPerTap: '100000',
+  refreshCapacityCooldownMs: 86_400_000,
   inboxSessionTtlMs: 300_000,
   allowedOrigins: [],
   rateLimitWindowMs: 60_000,
@@ -42,18 +43,22 @@ describe('RuntimeSettingsStore', () => {
     const store = new RuntimeSettingsStore(db, runtimeSettingsFromConfig(baseConfig));
 
     expect(store.get().maxBorrowPerTap).toBe('100000');
+    expect(store.get().refreshCapacityCooldownMs).toBe(86_400_000);
 
     const next = store.update({
       messagePriceSats: '2500',
       minFeeSats: '250',
       maxBorrowPerTap: '75000',
+      refreshCapacityCooldownMs: 3_600_000,
       maxPendingPerSender: 7,
     });
 
     expect(next.messagePriceSats).toBe('2500');
     expect(next.minFeeSats).toBe('250');
     expect(next.maxBorrowPerTap).toBe('75000');
+    expect(next.refreshCapacityCooldownMs).toBe(3_600_000);
     expect(next.maxPendingPerSender).toBe(7);
     expect(store.get().maxBorrowPerTap).toBe('75000');
+    expect(store.get().refreshCapacityCooldownMs).toBe(3_600_000);
   });
 });

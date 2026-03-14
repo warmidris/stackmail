@@ -11,7 +11,8 @@ type RuntimeSettingKey =
   | 'maxDeferredPerRecipient'
   | 'maxDeferredGlobal'
   | 'deferredMessageTtlMs'
-  | 'maxBorrowPerTap';
+  | 'maxBorrowPerTap'
+  | 'refreshCapacityCooldownMs';
 
 const RUNTIME_SETTING_KEYS: RuntimeSettingKey[] = [
   'messagePriceSats',
@@ -23,6 +24,7 @@ const RUNTIME_SETTING_KEYS: RuntimeSettingKey[] = [
   'maxDeferredGlobal',
   'deferredMessageTtlMs',
   'maxBorrowPerTap',
+  'refreshCapacityCooldownMs',
 ];
 
 export class RuntimeSettingsStore {
@@ -70,6 +72,7 @@ export class RuntimeSettingsStore {
       maxDeferredGlobal: parseInt(raw.maxDeferredGlobal ?? String(this.defaults.maxDeferredGlobal), 10),
       deferredMessageTtlMs: parseInt(raw.deferredMessageTtlMs ?? String(this.defaults.deferredMessageTtlMs), 10),
       maxBorrowPerTap: raw.maxBorrowPerTap ?? this.defaults.maxBorrowPerTap,
+      refreshCapacityCooldownMs: parseInt(raw.refreshCapacityCooldownMs ?? String(this.defaults.refreshCapacityCooldownMs), 10),
     };
   }
 
@@ -118,5 +121,6 @@ export function validateRuntimeSettings(input: RuntimeSettings): RuntimeSettings
     maxDeferredGlobal: positiveInt(input.maxDeferredGlobal, 'maxDeferredGlobal'),
     deferredMessageTtlMs: positiveInt(input.deferredMessageTtlMs, 'deferredMessageTtlMs'),
     maxBorrowPerTap,
+    refreshCapacityCooldownMs: positiveInt(input.refreshCapacityCooldownMs, 'refreshCapacityCooldownMs'),
   };
 }

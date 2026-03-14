@@ -383,6 +383,26 @@ export class ReservoirService {
     };
   }
 
+  private getLastRefreshAt(borrower: string): number | null {
+    const db = this.assertDb();
+    const row = db.prepare(`
+      SELECT last_refreshed_at
+      FROM reservoir_refreshes
+      WHERE borrower = ?
+    `).get(borrower) as { last_refreshed_at: number } | undefined;
+    return row?.last_refreshed_at ?? null;
+  }
+
+  private recordRefreshAt(borrower: string, refreshedAt: number): void {
+    const db = this.assertDb();
+    db.prepare(`
+      INSERT INTO reservoir_refreshes (borrower, last_refreshed_at)
+      VALUES (?, ?)
+      ON CONFLICT(borrower) DO UPDATE SET
+        last_refreshed_at = excluded.last_refreshed_at
+    `).run(borrower, refreshedAt);
+  }
+
   private assertNoOptimisticPendingStates(pipeId: string, enforceableNonce: bigint): void {
     const latestPending = this.getLatestPendingPipeRow(pipeId);
     if (latestPending && BigInt(latestPending.nonce) > enforceableNonce) {
@@ -431,6 +451,11 @@ export class ReservoirService {
         PRIMARY KEY (pipe_id, nonce)
       );
       CREATE INDEX IF NOT EXISTS idx_pending_pipe_updated ON reservoir_pending_states (pipe_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS reservoir_refreshes (
+        borrower          TEXT PRIMARY KEY,
+        last_refreshed_at INTEGER NOT NULL
+      );
     `);
 
     const cols = db.prepare(`PRAGMA table_info('reservoir_pipes')`).all() as Array<{ name: string }>;
@@ -1651,6 +1676,20 @@ export class ReservoirService {
         'invalid-reservoir-balance',
       );
     }
+    const refreshCapacityCooldownMs = settings.refreshCapacityCooldownMs;
+    if (refreshCapacityCooldownMs > 0) {
+      const lastRefreshedAt = this.getLastRefreshAt(args.borrower);
+      if (lastRefreshedAt != null) {
+        const nextRefreshAt = lastRefreshedAt + refreshCapacityCooldownMs;
+        if (Date.now() < nextRefreshAt) {
+          throw new ReservoirError(
+            429,
+            `receive capacity refresh is on cooldown until ${new Date(nextRefreshAt).toISOString()}`,
+            'refresh-cooldown-active',
+          );
+        }
+      }
+    }
 
     let providedBorrowFee: bigint | null = null;
     if (args.borrowFee != null && args.borrowFee.trim() !== '') {
@@ -1704,6 +1743,7 @@ export class ReservoirService {
       this.serverPrivateKey,
       this.chainId,
     );
+    this.recordRefreshAt(args.borrower, Date.now());
     return {
       borrowFee: borrowFee.toString(),
       reservoirSignature,

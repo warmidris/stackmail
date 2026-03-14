@@ -45,6 +45,7 @@ function makeSettingsStore(db: import('better-sqlite3').Database) {
     maxDeferredGlobal: 200,
     deferredMessageTtlMs: 86_400_000,
     maxBorrowPerTap: '100000',
+    refreshCapacityCooldownMs: 86_400_000,
   }));
 }
 
@@ -583,6 +584,107 @@ describe('ReservoirService', () => {
 
     expect(result.borrowFee).toBe('0');
     expect(typeof result.reservoirSignature).toBe('string');
+  });
+
+  it('rate-limits refresh signing per borrower during the cooldown window', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const serverPriv = privKeyHex();
+    const borrowerPriv = privKeyHex();
+    const signerAddress = stxAddressFromPrivkey(serverPriv);
+    const borrowerAddress = stxAddressFromPrivkey(borrowerPriv);
+    const reservoirContractId = `${signerAddress}.sm-reservoir`;
+    const contractId = `${signerAddress}.sm-stackflow`;
+    const settings = new RuntimeSettingsStore(db, runtimeSettingsFromConfig({
+      messagePriceSats: '500',
+      minFeeSats: '100',
+      maxPendingPerSender: 5,
+      maxPendingPerRecipient: 20,
+      maxDeferredPerSender: 5,
+      maxDeferredPerRecipient: 20,
+      maxDeferredGlobal: 200,
+      deferredMessageTtlMs: 86_400_000,
+      maxBorrowPerTap: '100000',
+      refreshCapacityCooldownMs: 86_400_000,
+    }));
+    const service = new ReservoirService({
+      db,
+      settings,
+      serverAddress: reservoirContractId,
+      signerAddress,
+      reservoirContractId,
+      serverPrivateKey: serverPriv,
+      contractId,
+      chainId: 1,
+    });
+
+    const principals = canonicalPipePrincipals(borrowerAddress, reservoirContractId);
+    db.prepare(`
+      INSERT INTO reservoir_pipes (
+        pipe_id, contract_id, pipe_key_json, server_balance, counterparty_balance, nonce, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, unixepoch('now') * 1000)
+    `).run(
+      pipeId(contractId, principals['principal-1'], principals['principal-2']),
+      contractId,
+      JSON.stringify({
+        'principal-1': principals['principal-1'],
+        'principal-2': principals['principal-2'],
+        token: null,
+      }),
+      '6000',
+      '14000',
+      '8',
+    );
+
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ okay: true, result: '0x0100000000000000000000000000000000' }),
+    })) as unknown as typeof fetch);
+
+    const refreshState: TransferState = {
+      pipeKey: {
+        'principal-1': principals['principal-1'],
+        'principal-2': principals['principal-2'],
+        token: null,
+      },
+      forPrincipal: borrowerAddress,
+      myBalance: '14000',
+      theirBalance: '10000',
+      nonce: '9',
+      action: '2',
+      actor: reservoirContractId,
+      hashedSecret: null,
+      validAfter: null,
+    };
+    const borrowerSig = await sip018Sign(contractId, buildTransferMessage(refreshState), borrowerPriv, 1);
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_710_000_000_000);
+
+    await expect(service.createBorrowLiquidityParams({
+      borrower: borrowerAddress,
+      token: null,
+      borrowAmount: '4000',
+      myBalance: '14000',
+      reservoirBalance: '10000',
+      borrowNonce: '9',
+      mySignature: borrowerSig,
+    })).resolves.toMatchObject({
+      borrowFee: '0',
+    });
+
+    await expect(service.createBorrowLiquidityParams({
+      borrower: borrowerAddress,
+      token: null,
+      borrowAmount: '4000',
+      myBalance: '14000',
+      reservoirBalance: '10000',
+      borrowNonce: '9',
+      mySignature: borrowerSig,
+    })).rejects.toMatchObject({
+      reason: 'refresh-cooldown-active',
+      statusCode: 429,
+    });
+
+    nowSpy.mockRestore();
   });
 
   it('refuses to sign a refresh when receive liquidity is already above the default target', async () => {

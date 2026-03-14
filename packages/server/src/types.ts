@@ -148,6 +148,8 @@ export interface Config {
   deferredMessageTtlMs: number;
   /** Max additional receive liquidity the server will offer to a single tap */
   maxBorrowPerTap: string;
+  /** Minimum delay between receive-capacity refreshes for the same borrower */
+  refreshCapacityCooldownMs: number;
   inboxSessionTtlMs: number;
   allowedOrigins: string[];
   rateLimitWindowMs: number;
@@ -169,6 +171,7 @@ export interface RuntimeSettings {
   maxDeferredGlobal: number;
   deferredMessageTtlMs: number;
   maxBorrowPerTap: string;
+  refreshCapacityCooldownMs: number;
 }
 
 export function runtimeSettingsFromConfig(config: Pick<
@@ -182,6 +185,7 @@ export function runtimeSettingsFromConfig(config: Pick<
   | 'maxDeferredGlobal'
   | 'deferredMessageTtlMs'
   | 'maxBorrowPerTap'
+  | 'refreshCapacityCooldownMs'
 >): RuntimeSettings {
   return {
     messagePriceSats: config.messagePriceSats,
@@ -193,6 +197,7 @@ export function runtimeSettingsFromConfig(config: Pick<
     maxDeferredGlobal: config.maxDeferredGlobal,
     deferredMessageTtlMs: config.deferredMessageTtlMs,
     maxBorrowPerTap: config.maxBorrowPerTap,
+    refreshCapacityCooldownMs: config.refreshCapacityCooldownMs,
   };
 }
 
@@ -223,6 +228,7 @@ export function loadConfig(): Config {
     maxDeferredGlobal: parseInt(process.env.MAILSLOT_MAX_DEFERRED_GLOBAL ?? '200', 10),
     deferredMessageTtlMs: parseInt(process.env.MAILSLOT_DEFERRED_MESSAGE_TTL_MS ?? '86400000', 10),
     maxBorrowPerTap: process.env.MAILSLOT_MAX_BORROW_PER_TAP ?? '100000',
+    refreshCapacityCooldownMs: parseInt(process.env.MAILSLOT_REFRESH_CAPACITY_COOLDOWN_MS ?? '86400000', 10),
     inboxSessionTtlMs: parseInt(process.env.MAILSLOT_INBOX_SESSION_TTL_MS ?? '300000', 10),
     allowedOrigins: (process.env.MAILSLOT_ALLOWED_ORIGINS ?? '')
       .split(',')
