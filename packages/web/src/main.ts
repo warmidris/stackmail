@@ -584,12 +584,6 @@ let walletAddress: string | null = null;
 let walletPubkey: string | null  = null;
 let serverStatus: Record<string, unknown> = {};
 let pipeState = { myBalance: 0n, serverBalance: 0n, nonce: 0n };
-let pipeBalanceBreakdown = {
-  settledMyBalance: null as bigint | null,
-  settledServerBalance: null as bigint | null,
-  pendingMyBalance: null as bigint | null,
-  pendingServerBalance: null as bigint | null,
-};
 let inboxDecryptPrivateKey: string | null = null;
 let walletCryptoAvailable = false;
 let lastInboxMessages: InboxMessage[] = [];
@@ -893,12 +887,6 @@ function disconnectWallet(): void {
   walletPubkey  = null;
   walletCryptoAvailable = false;
   pipeState     = { myBalance: 0n, serverBalance: 0n, nonce: 0n };
-  pipeBalanceBreakdown = {
-    settledMyBalance: null,
-    settledServerBalance: null,
-    pendingMyBalance: null,
-    pendingServerBalance: null,
-  };
   lastInboxMessages = [];
   inboxActionMessageId = null;
   cachedGetInboxAuth = null;
@@ -952,12 +940,6 @@ async function onWalletConnected(): Promise<void> {
     setAppState('no-tap');
   } else {
     pipeState = { myBalance: tap.userBalance, serverBalance: tap.reservoirBalance, nonce: tap.nonce };
-    pipeBalanceBreakdown = {
-      settledMyBalance: tap.settledUserBalance,
-      settledServerBalance: tap.settledReservoirBalance,
-      pendingMyBalance: tap.pendingUserBalance,
-      pendingServerBalance: tap.pendingReservoirBalance,
-    };
     updateIdentityUI();
     setAppState('ready');
     showTab('inbox');
@@ -1336,12 +1318,6 @@ async function refreshCurrentTapState(): Promise<void> {
   const tap = await resolveTapState(walletAddress);
   if (!tap) return;
   pipeState = { myBalance: tap.userBalance, serverBalance: tap.reservoirBalance, nonce: tap.nonce };
-  pipeBalanceBreakdown = {
-    settledMyBalance: tap.settledUserBalance,
-    settledServerBalance: tap.settledReservoirBalance,
-    pendingMyBalance: tap.pendingUserBalance,
-    pendingServerBalance: tap.pendingReservoirBalance,
-  };
   updateIdentityUI();
 }
 
@@ -1468,10 +1444,10 @@ async function addFundsToTap(): Promise<void> {
 }
 
 async function borrowMoreLiquidity(
-  explicitAmount?: bigint,
+  amount: bigint,
   options: { buttonId?: string; buttonText?: string; spinnerText?: string; successText?: string } = {},
 ): Promise<void> {
-  const btn = document.getElementById(options.buttonId ?? 'borrow-more-btn') as HTMLButtonElement | null;
+  const btn = document.getElementById(options.buttonId ?? 'refresh-capacity-btn') as HTMLButtonElement | null;
   const statusEl = document.getElementById('liquidity-status') as HTMLElement;
   if (btn) {
     btn.disabled = true;
@@ -1487,9 +1463,8 @@ async function borrowMoreLiquidity(
     const reservoir = getRuntimeReservoirContract();
     const supportedToken = getRuntimeSupportedToken();
     const tokenAssetName = supportedToken == null ? null : getRuntimeSupportedTokenAssetName();
-    const amount = explicitAmount ?? readPositiveAmountInput('borrow-more-amount-input', 'Borrow amount');
-    const tap = await queryOnChainTap(walletAddress);
-    if (!tap) throw new Error('No on-chain tap found. Open your mailbox first.');
+    const tap = await resolveTapState(walletAddress);
+    if (!tap) throw new Error('No tap found. Open your mailbox first.');
     if (amount <= 0n) {
       statusEl.innerHTML = '<div class="alert alert-info">Receive capacity is already at or above target.</div>';
       return;
@@ -1594,21 +1569,19 @@ async function borrowMoreLiquidity(
     });
     await loadStatus();
     statusEl.innerHTML = `<div class="alert alert-success">${escHtml(options.successText ?? 'Receive liquidity increased successfully.')}<br><a href="${escHtml(formatExplorerTxUrl(txId, chainId))}" target="_blank" rel="noopener" class="mono" style="color:inherit">${escHtml(txId)}</a></div>`;
-    const input = document.getElementById('borrow-more-amount-input') as HTMLInputElement | null;
-    if (input) input.value = '';
   } catch (e) {
     const msg = typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error');
     statusEl.innerHTML = `<div class="alert alert-error">${escHtml(msg)}</div>`;
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = options.buttonText ?? 'Borrow More';
+      btn.textContent = options.buttonText ?? 'Refresh Capacity';
     }
   }
 }
 
 async function refreshReceiveCapacity(): Promise<void> {
-  const tap = walletAddress ? await queryOnChainTap(walletAddress) : null;
+  const tap = walletAddress ? await resolveTapState(walletAddress) : null;
   const currentLiquidity = tap?.reservoirBalance ?? pipeState.serverBalance;
   const refreshAmount = getCapacityRefreshAmount(currentLiquidity);
   await borrowMoreLiquidity(refreshAmount, {
@@ -1840,12 +1813,6 @@ async function checkTapAfterTx(): Promise<void> {
   const tap = await resolveTapState(walletAddress!);
   if (tap) {
     pipeState = { myBalance: tap.userBalance, serverBalance: tap.reservoirBalance, nonce: tap.nonce };
-    pipeBalanceBreakdown = {
-      settledMyBalance: tap.settledUserBalance,
-      settledServerBalance: tap.settledReservoirBalance,
-      pendingMyBalance: tap.pendingUserBalance,
-      pendingServerBalance: tap.pendingReservoirBalance,
-    };
     updateIdentityUI();
     setAppState('ready');
     showTab('inbox');
@@ -2299,12 +2266,6 @@ async function fetchRecipientInfo(toAddr: string): Promise<void> {
     const tap = await resolveTapState(walletAddress!);
     if (tap) {
       pipeState = { myBalance: tap.userBalance, serverBalance: tap.reservoirBalance, nonce: tap.nonce };
-      pipeBalanceBreakdown = {
-        settledMyBalance: tap.settledUserBalance,
-        settledServerBalance: tap.settledReservoirBalance,
-        pendingMyBalance: tap.pendingUserBalance,
-        pendingServerBalance: tap.pendingReservoirBalance,
-      };
       (document.getElementById('pay-balance') as HTMLElement).textContent = formatPaymentAmount(pipeState.myBalance);
       (document.getElementById('pay-nonce') as HTMLElement).textContent   = `${pipeState.nonce}`;
       const receiveSummary = describeReceiveCapacity(pipeState.serverBalance);
@@ -2313,12 +2274,6 @@ async function fetchRecipientInfo(toAddr: string): Promise<void> {
         `<span style="color:${receiveSummary.tone === 'low' ? 'var(--amber)' : 'var(--muted)'}">${escHtml(receiveSummary.message)}</span>`;
       (document.getElementById('send-btn') as HTMLButtonElement).disabled = pipeState.myBalance < BigInt(String(recipientInfo.amount));
     } else {
-      pipeBalanceBreakdown = {
-        settledMyBalance: null,
-        settledServerBalance: null,
-        pendingMyBalance: null,
-        pendingServerBalance: null,
-      };
       (document.getElementById('tap-status') as HTMLElement).innerHTML =
         `<span style="color:var(--red)">✗ No channel found on-chain</span>`;
       (document.getElementById('send-btn') as HTMLButtonElement).disabled = true;
@@ -2431,12 +2386,6 @@ async function sendMessage(): Promise<void> {
 
     // Commit state
     pipeState = { myBalance: newMyBalance, serverBalance: newServerBalance, nonce: newNonce };
-    pipeBalanceBreakdown = {
-      settledMyBalance: null,
-      settledServerBalance: null,
-      pendingMyBalance: null,
-      pendingServerBalance: null,
-    };
     updateIdentityUI();
     (document.getElementById('pay-balance') as HTMLElement).textContent = formatPaymentAmount(pipeState.myBalance);
     (document.getElementById('pay-nonce') as HTMLElement).textContent   = `${pipeState.nonce}`;
@@ -2594,10 +2543,6 @@ function updateIdentityUI(): void {
   const tapEl = document.getElementById('status-tap-info');
   if (!tapEl) return;
   if (pipeState.nonce > 0n || pipeState.myBalance > 0n) {
-    const settledMy = pipeBalanceBreakdown.settledMyBalance;
-    const settledServer = pipeBalanceBreakdown.settledServerBalance;
-    const pendingMy = pipeBalanceBreakdown.pendingMyBalance;
-    const pendingServer = pipeBalanceBreakdown.pendingServerBalance;
     const sendTarget = getOpenTapAmount();
     const receiveTarget = getTargetReceiveLiquidity();
     const remainingReceives = getRemainingReceives(pipeState.serverBalance);
@@ -2625,18 +2570,7 @@ function updateIdentityUI(): void {
           <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Nonce</div>
           <div style="font-size:15px;color:var(--text)">${pipeState.nonce}</div>
         </div>
-      </div>
-      ${settledMy != null || settledServer != null || pendingMy != null || pendingServer != null ? `
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
-        <div>
-          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Your settled / pending</div>
-          <div style="font-size:13px;color:var(--text)">${escHtml(formatPaymentAmount(settledMy ?? 0n))} / ${escHtml(formatPaymentAmount(pendingMy ?? 0n))}</div>
-        </div>
-        <div>
-          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Reservoir settled / pending</div>
-          <div style="font-size:13px;color:var(--text)">${escHtml(formatPaymentAmount(settledServer ?? 0n))} / ${escHtml(formatPaymentAmount(pendingServer ?? 0n))}</div>
-        </div>
-      </div>` : ''}`;
+      </div>`;
   } else {
     tapEl.textContent = 'No channel state loaded.';
   }
@@ -2904,34 +2838,43 @@ async function copyToClipboard(text: string): Promise<boolean> {
 // Event wiring
 // ─────────────────────────────────────────────────────────────────────────────
 
-document.getElementById('connect-wallet-btn')!.addEventListener('click', connectWallet);
-document.getElementById('connect-wallet-main')!.addEventListener('click', connectWallet);
-document.getElementById('disconnect-btn')!.addEventListener('click', disconnectWallet);
-document.getElementById('open-mailbox-btn')!.addEventListener('click', openMailbox);
-document.getElementById('check-tap-btn')!.addEventListener('click', checkTapAfterTx);
-document.getElementById('add-funds-btn')!.addEventListener('click', addFundsToTap);
-document.getElementById('borrow-more-btn')!.addEventListener('click', borrowMoreLiquidity);
-document.getElementById('refresh-capacity-btn')!.addEventListener('click', refreshReceiveCapacity);
+function bindEvent<K extends keyof HTMLElementEventMap>(
+  id: string,
+  event: K,
+  handler: (ev: HTMLElementEventMap[K]) => void | Promise<void>,
+): void {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener(event, handler as EventListener);
+}
+
+bindEvent('connect-wallet-btn', 'click', connectWallet);
+bindEvent('connect-wallet-main', 'click', connectWallet);
+bindEvent('disconnect-btn', 'click', disconnectWallet);
+bindEvent('open-mailbox-btn', 'click', openMailbox);
+bindEvent('check-tap-btn', 'click', checkTapAfterTx);
+bindEvent('add-funds-btn', 'click', addFundsToTap);
+bindEvent('refresh-capacity-btn', 'click', () => refreshReceiveCapacity());
 
 document.querySelectorAll<HTMLButtonElement>('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => showTab(btn.dataset.tab ?? ''));
 });
 
-document.getElementById('refresh-inbox-btn')!.addEventListener('click', loadInbox);
-document.getElementById('show-claimed-cb')!.addEventListener('change', loadInbox);
-document.getElementById('save-decrypt-key-btn')!.addEventListener('click', saveDecryptKey);
-document.getElementById('clear-decrypt-key-btn')!.addEventListener('click', clearDecryptKey);
-document.getElementById('send-btn')!.addEventListener('click', sendMessage);
-document.getElementById('admin-set-agent-btn')!.addEventListener('click', setReservoirAgent);
-document.getElementById('admin-set-rate-btn')!.addEventListener('click', setBorrowRate);
-document.getElementById('admin-save-settings-btn')!.addEventListener('click', saveAdminRuntimeSettings);
+bindEvent('refresh-inbox-btn', 'click', loadInbox);
+bindEvent('show-claimed-cb', 'change', loadInbox);
+bindEvent('save-decrypt-key-btn', 'click', saveDecryptKey);
+bindEvent('clear-decrypt-key-btn', 'click', clearDecryptKey);
+bindEvent('send-btn', 'click', sendMessage);
+bindEvent('admin-set-agent-btn', 'click', setReservoirAgent);
+bindEvent('admin-set-rate-btn', 'click', setBorrowRate);
+bindEvent('admin-save-settings-btn', 'click', saveAdminRuntimeSettings);
 document.addEventListener('click', async (event) => {
   const target = event.target as HTMLElement | null;
   const button = target?.closest<HTMLButtonElement>('#capacity-banner-refresh-btn, #status-capacity-refresh-btn');
   if (!button) return;
   await refreshReceiveCapacity();
 });
-document.getElementById('inbox-list')!.addEventListener('click', async (event) => {
+bindEvent('inbox-list', 'click', async (event) => {
   const target = event.target as HTMLElement | null;
   const button = target?.closest<HTMLButtonElement>('button[data-action][data-message-id]');
   if (!button) return;
@@ -2960,24 +2903,24 @@ document.getElementById('inbox-list')!.addEventListener('click', async (event) =
   }
 });
 
-document.getElementById('copy-inbox-addr-btn')!.addEventListener('click', async () => {
+bindEvent('copy-inbox-addr-btn', 'click', async () => {
   const btn = document.getElementById('copy-inbox-addr-btn') as HTMLButtonElement;
   const ok = await copyToClipboard(walletAddress || '');
   btn.textContent = ok ? 'Copied!' : 'Copy failed';
   setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
 });
 
-document.getElementById('copy-status-addr-btn')!.addEventListener('click', async () => {
+bindEvent('copy-status-addr-btn', 'click', async () => {
   const btn = document.getElementById('copy-status-addr-btn') as HTMLButtonElement;
   const ok = await copyToClipboard(walletAddress || '');
   btn.textContent = ok ? 'Copied!' : 'Copy failed';
   setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
 });
-document.getElementById('refresh-status-btn')!.addEventListener('click', refreshStatusPanel);
+bindEvent('refresh-status-btn', 'click', refreshStatusPanel);
 
 // Auto-fetch recipient info when a valid address is typed
 let toDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-document.getElementById('to-input')!.addEventListener('input', (e) => {
+bindEvent('to-input', 'input', (e) => {
   const val = (e.target as HTMLInputElement).value.trim();
   recipientInfo = null;
   (document.getElementById('send-btn') as HTMLButtonElement).disabled = true;

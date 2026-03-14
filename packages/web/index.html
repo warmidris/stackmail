@@ -534,6 +534,8 @@
         </div>
       </div>
 
+      <div id="capacity-banner" style="display:none;margin-bottom:16px"></div>
+
       <div class="card" id="decrypt-key-section" style="margin-bottom:16px">
         <div class="card-title">Inbox Decrypt Key</div>
         <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
@@ -657,13 +659,26 @@
         <div style="font-size:11px;color:var(--muted)">
           Pubkey: <span class="mono" id="status-wallet-pubkey">—</span>
         </div>
+        <div id="status-capacity-alert" style="margin-top:12px"></div>
         <hr class="divider">
         <div class="card-title">Channel Status</div>
         <div id="status-tap-info" style="font-size:13px;color:var(--muted)">Loading…</div>
         <hr class="divider">
-        <div class="card-title">Manage Liquidity</div>
+        <div class="card-title">Capacity Controls</div>
         <div style="font-size:12px;color:var(--muted);margin-bottom:8px;line-height:1.5">
-          Add funds to increase your send capacity. Borrow liquidity to increase how much incoming value the reservoir can forward to you when others send mail. Borrowing does not increase your spendable balance.
+          Add funds to increase your send capacity. Incoming receive liquidity is provisioned by the reservoir for you; when it runs low, use Refresh Capacity to restore your mailbox's receive headroom with a signature.
+        </div>
+        <div class="info-panel" style="margin-bottom:14px">
+          <div class="info-panel-row">
+            <span class="info-panel-label">Receive capacity</span>
+            <span class="info-panel-value">Reservoir-provided and refreshed on demand</span>
+          </div>
+          <div style="margin-top:8px;font-size:12px;color:var(--muted);line-height:1.5">
+            The refresh flow asks you to sign the updated deposit state so the server can top your incoming liquidity back up to the default target.
+          </div>
+          <div style="margin-top:12px">
+            <button class="btn btn-primary" id="refresh-capacity-btn">Refresh Capacity</button>
+          </div>
         </div>
         <div class="grid-2">
           <div>
@@ -672,13 +687,6 @@
               <input type="text" id="add-funds-amount-input" placeholder="e.g. 10000" spellcheck="false" autocomplete="off" />
             </div>
             <button class="btn btn-secondary" id="add-funds-btn">Add Funds</button>
-          </div>
-          <div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="borrow-more-amount-input">Borrow Receive Liquidity</label>
-              <input type="text" id="borrow-more-amount-input" placeholder="e.g. 10000" spellcheck="false" autocomplete="off" />
-            </div>
-            <button class="btn btn-secondary" id="borrow-more-btn">Borrow More</button>
           </div>
         </div>
         <div id="liquidity-status" style="margin-top:10px"></div>

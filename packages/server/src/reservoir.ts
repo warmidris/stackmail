@@ -83,6 +83,8 @@ interface PendingLeg {
   burnHeight: bigint | null;
 }
 
+const TARGET_RECEIVE_CAPACITY_MULTIPLIER = 20n;
+
 function serializePrincipalForSort(principal: string): Buffer {
   return Buffer.from(serializeCVBytes(principalCV(principal)));
 }
@@ -340,6 +342,44 @@ export class ReservoirService {
       counterpartyBalance,
       nonce: onChainPipe.nonce,
       hasUnmaturedPending: isPendingActive(onChainPipe.pendingLeg1) || isPendingActive(onChainPipe.pendingLeg2),
+    };
+  }
+
+  private getCurrentTrackedTapSnapshot(counterparty: string, token: string | null): {
+    pipeId: string;
+    pipeKey: { 'principal-1': string; 'principal-2': string; token: string | null };
+    serverBalance: bigint;
+    counterpartyBalance: bigint;
+    nonce: bigint;
+  } {
+    if (!this.contractId) {
+      throw new ReservoirError(503, 'stackflow contract not configured', 'stackflow-contract-missing');
+    }
+    const principals = canonicalPipePrincipals(this.serverAddress, counterparty);
+    const row = this.getLatestPipeStateForPrincipals(
+      this.contractId,
+      principals['principal-1'],
+      principals['principal-2'],
+    );
+    if (!row) {
+      throw new ReservoirError(404, `no tap found for ${counterparty}`, 'no-tap');
+    }
+
+    const pipeKey = JSON.parse(row.pipe_key_json) as {
+      'principal-1': string;
+      'principal-2': string;
+      token: string | null;
+    };
+    if (pipeKey.token !== token) {
+      throw new ReservoirError(409, 'tracked tap token did not match the requested refresh token', 'tap-token-mismatch');
+    }
+
+    return {
+      pipeId: row.pipe_id,
+      pipeKey,
+      serverBalance: BigInt(row.server_balance),
+      counterpartyBalance: BigInt(row.counterparty_balance),
+      nonce: BigInt(row.nonce),
     };
   }
 
@@ -1572,32 +1612,44 @@ export class ReservoirService {
       throw new ReservoirError(400, 'borrowAmount must be > 0', 'invalid-borrow-amount');
     }
 
-    const current = await this.getCurrentOnChainTapSnapshot(args.borrower, token);
-    this.assertNoOptimisticPendingStates(current.pipeId, current.nonce);
-    if (current.hasUnmaturedPending) {
-      throw new ReservoirError(
-        409,
-        'tap has an on-chain pending deposit that has not matured yet',
-        'tap-has-onchain-pending',
-      );
-    }
+    const current = this.getCurrentTrackedTapSnapshot(args.borrower, token);
     if (borrowNonce !== current.nonce + 1n) {
       throw new ReservoirError(400, `borrowNonce must be ${current.nonce + 1n}`, 'invalid-borrow-nonce');
     }
     const settings = this.settings.get();
     const maxBorrowPerTap = BigInt(settings.maxBorrowPerTap);
-    if (current.serverBalance + borrowAmount > maxBorrowPerTap) {
+    const targetReceiveLiquidity = BigInt(settings.messagePriceSats) * TARGET_RECEIVE_CAPACITY_MULTIPLIER;
+    if (targetReceiveLiquidity > maxBorrowPerTap) {
       throw new ReservoirError(
         400,
-        `borrow would exceed the reservoir offer cap for a single tap (${maxBorrowPerTap})`,
+        `refresh target would exceed the reservoir offer cap for a single tap (${maxBorrowPerTap})`,
         'borrow-cap-exceeded',
+      );
+    }
+    if (current.serverBalance >= targetReceiveLiquidity) {
+      throw new ReservoirError(
+        409,
+        'receive capacity is already at or above the default target',
+        'capacity-already-sufficient',
+      );
+    }
+    const requiredBorrowAmount = targetReceiveLiquidity - current.serverBalance;
+    if (borrowAmount !== requiredBorrowAmount) {
+      throw new ReservoirError(
+        400,
+        `borrowAmount must exactly refresh receive capacity to the default target (${requiredBorrowAmount})`,
+        'invalid-refresh-amount',
       );
     }
     if (myBalance !== current.counterpartyBalance) {
       throw new ReservoirError(400, 'myBalance must equal the current user balance', 'invalid-my-balance');
     }
-    if (reservoirBalance !== current.serverBalance + borrowAmount) {
-      throw new ReservoirError(400, 'reservoirBalance must equal current reservoir balance plus borrow amount', 'invalid-reservoir-balance');
+    if (reservoirBalance !== targetReceiveLiquidity) {
+      throw new ReservoirError(
+        400,
+        'reservoirBalance must equal the default receive-capacity target',
+        'invalid-reservoir-balance',
+      );
     }
 
     let providedBorrowFee: bigint | null = null;

@@ -46,7 +46,7 @@ Human commands:
   mailslot read <message-id> [--server <url>]
   mailslot reply <message-id> [--server <url>]
   mailslot status [--server <url>]
-  mailslot refresh-capacity [--server <url>] [--amount <raw-units>] [--json]
+  mailslot refresh-capacity [--server <url>] [--json]
 
 Agent/raw commands:
   mailslot inbox --json
@@ -403,8 +403,7 @@ async function refreshCapacity(ctx, options) {
 
   const capacity = getReceiveCapacitySummary(ctx.status, ctx.tap);
   const token = ctx.status.supportedToken ?? 'token';
-  const requestedAmount = typeof options.amount === 'string' ? BigInt(options.amount) : null;
-  const amount = requestedAmount ?? capacity.refreshAmount;
+  const amount = capacity.refreshAmount;
 
   if (amount <= 0n) {
     const payload = {
