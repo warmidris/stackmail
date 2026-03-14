@@ -237,6 +237,74 @@
       color: var(--text);
     }
 
+    .inbox-address-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border2);
+    }
+
+    .inbox-address-label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 4px;
+    }
+
+    .inbox-address-value {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text);
+      word-break: break-all;
+    }
+
+    .utility-card {
+      background: linear-gradient(135deg, rgba(88, 166, 255, 0.08), rgba(85, 70, 255, 0.08));
+      border: 1px solid rgba(88, 166, 255, 0.28);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }
+
+    .utility-card .card-title {
+      color: #8cc8ff;
+    }
+
+    .command-stack {
+      display: grid;
+      gap: 10px;
+    }
+
+    .command-box {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 12px 14px;
+      background: rgba(10, 14, 22, 0.5);
+      border: 1px solid rgba(140, 200, 255, 0.18);
+      border-radius: 10px;
+    }
+
+    .command-copy {
+      flex: 1 1 320px;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 12px;
+      color: var(--text);
+      word-break: break-all;
+    }
+
+    .inline-link {
+      color: #8cc8ff;
+      text-decoration: none;
+      border-bottom: 1px solid rgba(140, 200, 255, 0.35);
+    }
+    .inline-link:hover { color: #b6dcff; border-bottom-color: rgba(182, 220, 255, 0.7); }
+
     /* ── Spinner ─────────────────────────────────────────────────────── */
     .spinner {
       display: inline-block;
@@ -331,6 +399,122 @@
     }
     .info-panel-label { color: var(--muted); }
     .info-panel-value { color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; }
+
+    .compact-stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin: 16px 0;
+    }
+    @media (max-width: 600px) {
+      .compact-stats { grid-template-columns: 1fr; }
+    }
+
+    .compact-stat {
+      background: var(--surface2);
+      border: 1px solid var(--border2);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+    }
+
+    .compact-stat-label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 6px;
+    }
+
+    .compact-stat-value {
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .capacity-stack {
+      display: grid;
+      gap: 18px;
+      margin-top: 16px;
+    }
+
+    .capacity-block {
+      background: var(--surface2);
+      border: 1px solid var(--border2);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+
+    .capacity-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+
+    .capacity-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .capacity-copy {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .capacity-meter {
+      width: 100%;
+      height: 14px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+
+    .capacity-meter-fill {
+      height: 100%;
+      width: 0;
+      border-radius: 999px;
+      background: var(--green);
+      transition: width 0.2s ease, background 0.2s ease;
+    }
+
+    .capacity-meter-fill.warn { background: var(--yellow); }
+    .capacity-meter-fill.critical { background: var(--red); }
+
+    .capacity-values {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+
+    .capacity-primary {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .capacity-secondary {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .capacity-actions {
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+      flex-wrap: wrap;
+    }
+
+    .capacity-actions .form-group {
+      flex: 1 1 220px;
+      margin-bottom: 0;
+    }
 
     /* ── Misc ────────────────────────────────────────────────────────── */
     .divider { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
@@ -523,18 +707,27 @@
 
     <!-- Inbox tab -->
     <div class="tab-panel active" id="tab-inbox">
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-title">Your Inbox Address</div>
-        <div class="addr-row">
-          <span class="mono" id="inbox-addr">—</span>
-          <button class="btn btn-secondary btn-sm" id="copy-inbox-addr-btn">Copy</button>
+      <div class="inbox-address-header">
+        <div>
+          <div class="inbox-address-label">Inbox Address</div>
+          <div class="inbox-address-value mono" id="inbox-addr">—</div>
         </div>
-        <div style="margin-top:6px;font-size:12px;color:var(--muted)">
-          Share this address so others can send you messages.
-        </div>
+        <button class="btn btn-secondary btn-sm" id="copy-inbox-addr-btn">Copy</button>
       </div>
 
       <div id="capacity-banner" style="display:none;margin-bottom:16px"></div>
+
+      <div class="row" style="margin-bottom:16px">
+        <button class="btn btn-secondary" id="refresh-inbox-btn">⟳ Refresh</button>
+        <label style="margin:0;display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="show-claimed-cb" /> Show claimed
+        </label>
+        <div class="spacer"></div>
+        <div id="inbox-count" style="font-size:12px;color:var(--muted)"></div>
+      </div>
+
+      <div id="inbox-status"></div>
+      <div id="inbox-list"></div>
 
       <div class="card" id="decrypt-key-section" style="margin-bottom:16px">
         <div class="card-title">Inbox Decrypt Key</div>
@@ -552,25 +745,13 @@
         <div id="decrypt-key-status" style="margin-top:12px"></div>
       </div>
 
-      <div class="card" id="decrypt-cli-help" style="margin-bottom:16px;display:none">
+      <div class="card utility-card" id="decrypt-cli-help" style="margin-bottom:16px;display:none">
         <div class="card-title">CLI Decrypt Fallback</div>
         <div style="font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.5">
           If your wallet does not support Mailslot decrypt yet, use the local CLI to inspect your inbox and claim messages outside the browser.
         </div>
-        <pre id="decrypt-cli-commands" style="margin:0;white-space:pre-wrap;font-size:12px;line-height:1.5;color:var(--text);background:rgba(255,255,255,0.03);padding:12px;border-radius:10px;overflow:auto"></pre>
+        <div id="decrypt-cli-commands" class="command-stack"></div>
       </div>
-
-      <div class="row" style="margin-bottom:16px">
-        <button class="btn btn-secondary" id="refresh-inbox-btn">⟳ Refresh</button>
-        <label style="margin:0;display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
-          <input type="checkbox" id="show-claimed-cb" /> Show claimed
-        </label>
-        <div class="spacer"></div>
-        <div id="inbox-count" style="font-size:12px;color:var(--muted)"></div>
-      </div>
-
-      <div id="inbox-status"></div>
-      <div id="inbox-list"></div>
     </div>
 
     <!-- Compose tab -->
@@ -599,12 +780,8 @@
               <span class="info-panel-value" id="pay-price">—</span>
             </div>
             <div class="info-panel-row">
-              <span class="info-panel-label">Your channel balance</span>
+              <span class="info-panel-label">Your balance</span>
               <span class="info-panel-value" id="pay-balance">—</span>
-            </div>
-            <div class="info-panel-row">
-              <span class="info-panel-label">Nonce</span>
-              <span class="info-panel-value" id="pay-nonce">—</span>
             </div>
           </div>
           <div id="tap-status" style="margin-top:8px;font-size:12px"></div>
@@ -623,32 +800,13 @@
       <div class="status-row">
         <div style="display:flex;align-items:center;gap:10px">
           <div class="dot" id="health-dot"></div>
-          <span class="status-label" id="health-label">Checking server…</span>
+          <span class="status-label" id="health-label">Status</span>
         </div>
         <button class="btn btn-secondary btn-sm" id="refresh-status-btn">Refresh</button>
       </div>
 
-      <div class="grid-2" id="status-cards">
-        <div class="card">
-          <div class="card-title">Server Address</div>
-          <div class="card-value mono" id="s-addr">—</div>
-        </div>
-        <div class="card">
-          <div class="card-title">SF Contract</div>
-          <div class="card-value mono" id="s-contract">—</div>
-        </div>
-        <div class="card">
-          <div class="card-title">Message Price</div>
-          <div class="card-value" id="s-price">—</div>
-        </div>
-        <div class="card">
-          <div class="card-title">Network</div>
-          <div class="card-value" id="s-network">—</div>
-        </div>
-      </div>
-
       <div class="card">
-        <div class="card-title">Your Identity</div>
+        <div class="card-title">Your Mailbox</div>
         <div style="margin-bottom:8px">
           <span class="badge badge-green">● Wallet Connected</span>
         </div>
@@ -656,38 +814,26 @@
           <span id="status-wallet-addr">—</span>
           <button class="btn btn-secondary btn-sm" id="copy-status-addr-btn">Copy</button>
         </div>
-        <div style="font-size:11px;color:var(--muted)">
-          Pubkey: <span class="mono" id="status-wallet-pubkey">—</span>
+        <div class="compact-stats">
+          <div class="compact-stat">
+            <div class="compact-stat-label">Message Price</div>
+            <div class="compact-stat-value" id="status-price-total">—</div>
+          </div>
+          <div class="compact-stat">
+            <div class="compact-stat-label">To Recipient</div>
+            <div class="compact-stat-value" id="status-price-recipient">—</div>
+          </div>
+          <div class="compact-stat">
+            <div class="compact-stat-label">To Server</div>
+            <div class="compact-stat-value" id="status-price-fee">—</div>
+          </div>
+        </div>
+        <div style="font-size:12px;color:var(--muted)">
+          <span id="status-network-note">Loading network details…</span>
         </div>
         <div id="status-capacity-alert" style="margin-top:12px"></div>
-        <hr class="divider">
-        <div class="card-title">Channel Status</div>
-        <div id="status-tap-info" style="font-size:13px;color:var(--muted)">Loading…</div>
-        <hr class="divider">
-        <div class="card-title">Capacity Controls</div>
-        <div style="font-size:12px;color:var(--muted);margin-bottom:8px;line-height:1.5">
-          Add funds to increase your send capacity. Incoming receive liquidity is provisioned by the reservoir for you; when it runs low, use Refresh Capacity to restore your mailbox's receive headroom with a signature.
-        </div>
-        <div class="info-panel" style="margin-bottom:14px">
-          <div class="info-panel-row">
-            <span class="info-panel-label">Receive capacity</span>
-            <span class="info-panel-value">Reservoir-provided and refreshed on demand</span>
-          </div>
-          <div style="margin-top:8px;font-size:12px;color:var(--muted);line-height:1.5">
-            The refresh flow asks you to sign the updated deposit state so the server can top your incoming liquidity back up to the default target.
-          </div>
-          <div style="margin-top:12px">
-            <button class="btn btn-primary" id="refresh-capacity-btn">Refresh Capacity</button>
-          </div>
-        </div>
-        <div class="grid-2">
-          <div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="add-funds-amount-input">Add Funds Amount</label>
-              <input type="text" id="add-funds-amount-input" placeholder="e.g. 10000" spellcheck="false" autocomplete="off" />
-            </div>
-            <button class="btn btn-secondary" id="add-funds-btn">Add Funds</button>
-          </div>
+        <div id="status-tap-info" class="capacity-stack" style="margin-top:16px">
+          <div class="capacity-block" style="color:var(--muted)">Loading capacity…</div>
         </div>
         <div id="liquidity-status" style="margin-top:10px"></div>
 

@@ -120,6 +120,67 @@ function describeReceiveCapacity(liquidity: bigint): { tone: 'good' | 'low'; mes
   };
 }
 
+function getRuntimeMinFee(): bigint {
+  const raw = serverStatus.minFeeSats;
+  if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) return BigInt(raw);
+  return 0n;
+}
+
+function getMessageCapacity(balance: bigint): bigint {
+  const price = getRuntimeMessagePrice();
+  if (price <= 0n) return 0n;
+  return balance / price;
+}
+
+function getCapacityTone(messages: bigint): 'normal' | 'warn' | 'critical' {
+  if (messages < 3n) return 'critical';
+  if (messages < 5n) return 'warn';
+  return 'normal';
+}
+
+function getCapacityFillPercent(balance: bigint, target: bigint): number {
+  if (target <= 0n) return 0;
+  const scaled = Number((balance * 10000n) / target) / 100;
+  return Math.max(0, Math.min(100, scaled));
+}
+
+function shortPrincipal(value: string | null | undefined): string {
+  if (!value) return '—';
+  return value.length > 14 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
+}
+
+function renderCapacityBlock(options: {
+  title: string;
+  subtitle: string;
+  balance: bigint;
+  target: bigint;
+  actionMarkup: string;
+}): string {
+  const messages = getMessageCapacity(options.balance);
+  const tone = getCapacityTone(messages);
+  const fillPercent = getCapacityFillPercent(options.balance, options.target);
+  const fillClass = tone === 'normal' ? '' : tone;
+  return `
+    <div class="capacity-block">
+      <div class="capacity-head">
+        <div class="capacity-title">${escHtml(options.title)}</div>
+        <div class="capacity-copy">${escHtml(options.subtitle)}</div>
+      </div>
+      <div class="capacity-meter" aria-hidden="true">
+        <div class="capacity-meter-fill ${fillClass}" style="width:${fillPercent}%"></div>
+      </div>
+      <div class="capacity-values">
+        <div>
+          <div class="capacity-primary">${messages} message(s)</div>
+          <div class="capacity-secondary">${escHtml(formatPaymentAmount(options.balance))} available</div>
+        </div>
+      </div>
+      <div class="capacity-actions">
+        ${options.actionMarkup}
+      </div>
+    </div>`;
+}
+
 function extractSignature(resp: unknown): string | null {
   return (resp as { result?: { signature?: string }; signature?: string })?.result?.signature
     ?? (resp as { signature?: string })?.signature
@@ -156,6 +217,44 @@ function extractEncryptedMessage(resp: unknown): EncryptedMail | null {
     ?? (resp as { encryptedMessage?: EncryptedMail })?.encryptedMessage
     ?? null
   );
+}
+
+function extractErrorMessage(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'object' && error != null) {
+    const candidate = (error as { message?: unknown; reason?: unknown; shortMessage?: unknown; code?: unknown });
+    const parts = [
+      typeof candidate.message === 'string' ? candidate.message : '',
+      typeof candidate.reason === 'string' ? candidate.reason : '',
+      typeof candidate.shortMessage === 'string' ? candidate.shortMessage : '',
+      typeof candidate.code === 'string' || typeof candidate.code === 'number' ? String(candidate.code) : '',
+    ].filter(Boolean);
+    if (parts.length) return parts.join(' ');
+  }
+  return String(error ?? '');
+}
+
+function isWalletCancellationError(error: unknown): boolean {
+  const message = extractErrorMessage(error).toLowerCase();
+  return message.includes('cancelled')
+    || message.includes('canceled')
+    || message.includes('rejected')
+    || message.includes('user rejected')
+    || message.includes('user denied')
+    || message.includes('denied by user')
+    || message.includes('request aborted')
+    || message.includes('aborterror')
+    || message.includes('4001');
+}
+
+function normalizeWalletPromptError(error: unknown, action: 'connect' | 'signature' | 'transaction'): Error {
+  if (isWalletCancellationError(error)) {
+    if (action === 'connect') return new Error('Wallet connection cancelled');
+    if (action === 'transaction') return new Error('Transaction cancelled');
+    return new Error('Signature cancelled');
+  }
+  return error instanceof Error ? error : new Error(extractErrorMessage(error) || 'Unknown wallet error');
 }
 
 function extractDecryptedMessage(resp: unknown): string | null {
@@ -659,6 +758,12 @@ function updateDecryptKeyStatus(kind: 'info' | 'success' | 'warning' | 'error', 
   statusEl.innerHTML = `<div class="alert ${cls}">${escHtml(message)}</div>`;
 }
 
+function currentServerUrlPrefix(): string {
+  const current = window.location.origin.replace(/\/+$/, '');
+  const defaultUrl = 'https://mailslot.locker';
+  return current === defaultUrl ? '' : `MAILSLOT_SERVER_URL=${current} `;
+}
+
 function updateDecryptCliHelp(): void {
   const card = document.getElementById('decrypt-cli-help') as HTMLElement | null;
   const commandsEl = document.getElementById('decrypt-cli-commands') as HTMLElement | null;
@@ -668,22 +773,38 @@ function updateDecryptCliHelp(): void {
   card.style.display = shouldShow ? '' : 'none';
   if (!shouldShow) return;
 
-  const serverUrl = window.location.origin;
-  commandsEl.textContent = [
-    'Install:',
-    'curl -fsSL https://raw.githubusercontent.com/warmidris/mailslot/main/scripts/install-cli.sh | sh',
-    'export MAILSLOT_PRIVATE_KEY=<your-private-key>',
-    '',
-    'Open your inbox:',
-    `MAILSLOT_SERVER_URL=${serverUrl} mailslot inbox`,
-    '',
-    'Read a specific message:',
-    `MAILSLOT_SERVER_URL=${serverUrl} mailslot read <message-id>`,
-  ].join('\n');
+  const serverPrefix = currentServerUrlPrefix();
+  const commands = [
+    {
+      label: 'Install CLI',
+      command: 'curl -fsSL https://raw.githubusercontent.com/warmidris/mailslot/main/scripts/install-cli.sh | sh',
+    },
+    {
+      label: 'Set private key',
+      command: 'export MAILSLOT_PRIVATE_KEY=<your-private-key>',
+    },
+    {
+      label: 'Open your inbox',
+      command: `${serverPrefix}mailslot inbox`,
+    },
+    {
+      label: 'Read one message',
+      command: `${serverPrefix}mailslot read <message-id>`,
+    },
+  ];
+  commandsEl.innerHTML = commands.map(({ label, command }) => `
+    <div class="command-box">
+      <div style="flex:1 1 100%">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">${escHtml(label)}</div>
+        <div class="command-copy">${escHtml(command)}</div>
+      </div>
+      <button class="btn btn-secondary btn-sm" data-copy-text="${escHtml(command)}">Copy</button>
+    </div>
+  `).join('');
 }
 
 function cliReadCommand(messageId: string): string {
-  return `MAILSLOT_SERVER_URL=${window.location.origin} mailslot read ${messageId}`;
+  return `${currentServerUrlPrefix()}mailslot read ${messageId}`;
 }
 
 function updateDecryptKeyUI(): void {
@@ -832,7 +953,7 @@ async function connectWallet(): Promise<void> {
       } catch {
         const provider = getStacksProvider();
         if (!provider) {
-          throw err;
+          throw normalizeWalletPromptError(err, 'connect');
         }
         const addrsResp = await withTimeout(
           provider.request('stx_getAddresses'),
@@ -875,7 +996,8 @@ async function connectWallet(): Promise<void> {
     await refreshWalletCryptoAvailability();
     await onWalletConnected();
   } catch (e) {
-    const msg = typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error');
+    const normalized = normalizeWalletPromptError(e, 'connect');
+    const msg = normalized.message || 'Unknown error';
     (document.getElementById('wallet-error') as HTMLElement).innerHTML =
       `<div class="alert alert-error">Connection failed: ${escHtml(msg)}</div>`;
     btns.forEach(b => { b.disabled = false; b.textContent = 'Connect Wallet'; });
@@ -1041,7 +1163,7 @@ async function signStructuredMessageWithWallet(
     const sig = extractSignature(resp);
     if (sig) return { signature: sig, publicKey: extractPublicKey(resp) };
   } catch (err) {
-    lastError = err;
+    lastError = normalizeWalletPromptError(err, 'signature');
   }
 
   const provider = getStacksProvider();
@@ -1060,7 +1182,7 @@ async function signStructuredMessageWithWallet(
     const sig = extractSignature(resp);
     if (sig) return { signature: sig, publicKey: extractPublicKey(resp) };
   } catch (err) {
-    lastError = err;
+    lastError = normalizeWalletPromptError(err, 'signature');
   }
 
   // Last resort: wallet-json format for older provider implementations.
@@ -1073,7 +1195,7 @@ async function signStructuredMessageWithWallet(
     const sig = extractSignature(resp);
     if (sig) return { signature: sig, publicKey: extractPublicKey(resp) };
   } catch (err) {
-    lastError = err;
+    lastError = normalizeWalletPromptError(err, 'signature');
   }
 
   if (lastError) {
@@ -1435,7 +1557,7 @@ async function addFundsToTap(): Promise<void> {
     statusEl.innerHTML = `<div class="alert alert-success">Funds added successfully.<br><a href="${escHtml(formatExplorerTxUrl(txId, chainId))}" target="_blank" rel="noopener" class="mono" style="color:inherit">${escHtml(txId)}</a></div>`;
     (document.getElementById('add-funds-amount-input') as HTMLInputElement).value = '';
   } catch (e) {
-    const msg = typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error');
+    const msg = normalizeWalletPromptError(e, 'transaction').message || 'Unknown error';
     statusEl.innerHTML = `<div class="alert alert-error">${escHtml(msg)}</div>`;
   } finally {
     btn.disabled = false;
@@ -1570,7 +1692,7 @@ async function borrowMoreLiquidity(
     await loadStatus();
     statusEl.innerHTML = `<div class="alert alert-success">${escHtml(options.successText ?? 'Receive liquidity increased successfully.')}<br><a href="${escHtml(formatExplorerTxUrl(txId, chainId))}" target="_blank" rel="noopener" class="mono" style="color:inherit">${escHtml(txId)}</a></div>`;
   } catch (e) {
-    const msg = typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error');
+    const msg = normalizeWalletPromptError(e, 'transaction').message || 'Unknown error';
     statusEl.innerHTML = `<div class="alert alert-error">${escHtml(msg)}</div>`;
   } finally {
     if (btn) {
@@ -1794,7 +1916,7 @@ async function openMailbox(): Promise<void> {
     setAppState('tx-pending');
 
   } catch (e) {
-    const rawMsg = typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error');
+    const rawMsg = normalizeWalletPromptError(e, 'transaction').message || 'Unknown error';
     const msg = /Post-condition check failure.*SentEq 0/i.test(rawMsg)
       ? `${rawMsg}\n\nLikely cause: the reservoir signer is not registered as a StackFlow agent. In Status -> Reservoir Admin, call set-agent with the signer address.`
       : rawMsg;
@@ -2057,8 +2179,8 @@ function renderInboxMessages(messages: InboxMessage[]): void {
       : decryptReady
         ? '<span style="color:var(--muted)">Encrypted message ready to decrypt locally.</span>'
         : browserDecryptFallbackEnabled()
-          ? '<span style="color:var(--yellow)">Load your inbox decrypt key to claim and open this message.</span>'
-          : '<span style="color:var(--yellow)">Wallet-native decrypt is required on this server.</span>';
+          ? '<a class="inline-link" href="#decrypt-key-section">Load your inbox decrypt key to claim and open this message.</a>'
+          : '<a class="inline-link" href="#decrypt-key-section">Wallet-native decrypt is required on this server.</a>';
     const opened = openedInboxMessages[msg.id];
     const messageError = inboxMessageErrors[msg.id];
     const subject = opened?.subject?.trim() ? opened.subject : '(no subject)';
@@ -2189,6 +2311,11 @@ function formatPaymentAmount(amount: string | number | bigint): string {
   return `${value.toLocaleString()} ${getPaymentUnitLabel()}`;
 }
 
+function formatMessageCapacity(amount: bigint): string {
+  const messages = getMessageCapacity(amount);
+  return `${messages} message(s) • ${formatPaymentAmount(amount)}`;
+}
+
 async function lookupRecipientPubkey(addr: string): Promise<string | null> {
   try {
     const url = `https://api.mainnet.hiro.so/extended/v1/address/${encodeURIComponent(addr)}/transactions?limit=5`;
@@ -2260,18 +2387,13 @@ async function fetchRecipientInfo(toAddr: string): Promise<void> {
 
     (document.getElementById('payment-panel') as HTMLElement).style.display = '';
     (document.getElementById('pay-price') as HTMLElement).textContent   = formatPaymentAmount(recipientInfo.amount);
-    (document.getElementById('pay-balance') as HTMLElement).textContent = formatPaymentAmount(pipeState.myBalance);
-    (document.getElementById('pay-nonce') as HTMLElement).textContent   = `${pipeState.nonce}`;
+    (document.getElementById('pay-balance') as HTMLElement).textContent = formatMessageCapacity(pipeState.myBalance);
 
     const tap = await resolveTapState(walletAddress!);
     if (tap) {
       pipeState = { myBalance: tap.userBalance, serverBalance: tap.reservoirBalance, nonce: tap.nonce };
-      (document.getElementById('pay-balance') as HTMLElement).textContent = formatPaymentAmount(pipeState.myBalance);
-      (document.getElementById('pay-nonce') as HTMLElement).textContent   = `${pipeState.nonce}`;
-      const receiveSummary = describeReceiveCapacity(pipeState.serverBalance);
-      (document.getElementById('tap-status') as HTMLElement).innerHTML =
-        `<span style="color:var(--green)">✓ Channel open — ${escHtml(formatPaymentAmount(pipeState.myBalance))} available to send</span><br>` +
-        `<span style="color:${receiveSummary.tone === 'low' ? 'var(--amber)' : 'var(--muted)'}">${escHtml(receiveSummary.message)}</span>`;
+      (document.getElementById('pay-balance') as HTMLElement).textContent = formatMessageCapacity(pipeState.myBalance);
+      (document.getElementById('tap-status') as HTMLElement).innerHTML = '';
       (document.getElementById('send-btn') as HTMLButtonElement).disabled = pipeState.myBalance < BigInt(String(recipientInfo.amount));
     } else {
       (document.getElementById('tap-status') as HTMLElement).innerHTML =
@@ -2280,7 +2402,7 @@ async function fetchRecipientInfo(toAddr: string): Promise<void> {
     }
 
   } catch (e) {
-    resetErr(typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error'));
+    resetErr(normalizeWalletPromptError(e, 'signature').message || 'Unknown error');
   }
 }
 
@@ -2387,8 +2509,7 @@ async function sendMessage(): Promise<void> {
     // Commit state
     pipeState = { myBalance: newMyBalance, serverBalance: newServerBalance, nonce: newNonce };
     updateIdentityUI();
-    (document.getElementById('pay-balance') as HTMLElement).textContent = formatPaymentAmount(pipeState.myBalance);
-    (document.getElementById('pay-nonce') as HTMLElement).textContent   = `${pipeState.nonce}`;
+    (document.getElementById('pay-balance') as HTMLElement).textContent = formatMessageCapacity(pipeState.myBalance);
 
     statusEl.innerHTML = data.deferred
       ? `
@@ -2407,7 +2528,7 @@ async function sendMessage(): Promise<void> {
     (document.getElementById('subject-input') as HTMLInputElement).value = '';
 
   } catch (e) {
-    const msg = typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error');
+    const msg = normalizeWalletPromptError(e, 'transaction').message || 'Unknown error';
     statusEl.innerHTML = `<div class="alert alert-error">✗ ${escHtml(msg)}</div>`;
   } finally {
     sendBtn.disabled = false;
@@ -2447,13 +2568,7 @@ async function loadStatus(): Promise<void> {
     updateDecryptKeyUI();
     populateAdminSettingsForm(extractRuntimeSettings(data));
     dot.className    = data.ok ? 'dot green' : 'dot red';
-    label.textContent = data.ok ? 'Mailslot Server — Online' : 'Server returned error';
-    (document.getElementById('s-addr') as HTMLElement).textContent     = String(data.serverAddress || '—');
-    (document.getElementById('s-contract') as HTMLElement).textContent = String(data.sfContract    || '—');
-    (document.getElementById('s-price') as HTMLElement).textContent    = data.messagePriceSats
-      ? formatPaymentAmount(String(data.messagePriceSats)) : '—';
-    (document.getElementById('s-network') as HTMLElement).textContent  = data.network
-      ? String(data.network).charAt(0).toUpperCase() + String(data.network).slice(1) : '—';
+    label.textContent = data.ok ? 'Status' : 'Server unavailable';
     const adminAgentInput = document.getElementById('admin-agent-input') as HTMLInputElement | null;
     if (adminAgentInput && !adminAgentInput.value.trim()) {
       const candidate = typeof data.signerAddress === 'string'
@@ -2464,7 +2579,7 @@ async function loadStatus(): Promise<void> {
     await refreshCurrentTapState();
   } catch {
     dot.className    = 'dot red';
-    label.textContent = 'Cannot reach server';
+    label.textContent = 'Server unavailable';
   }
 }
 
@@ -2487,12 +2602,12 @@ async function refreshStatusPanel(): Promise<void> {
 function updateCapacityBanner(): void {
   const bannerEl = document.getElementById('capacity-banner') as HTMLElement | null;
   const statusAlertEl = document.getElementById('status-capacity-alert') as HTMLElement | null;
-  if (!bannerEl || !statusAlertEl) return;
-
   if (!(pipeState.nonce > 0n || pipeState.myBalance > 0n || pipeState.serverBalance > 0n)) {
-    bannerEl.style.display = 'none';
-    bannerEl.innerHTML = '';
-    statusAlertEl.innerHTML = '';
+    if (bannerEl) {
+      bannerEl.style.display = 'none';
+      bannerEl.innerHTML = '';
+    }
+    if (statusAlertEl) statusAlertEl.innerHTML = '';
     return;
   }
 
@@ -2504,28 +2619,29 @@ function updateCapacityBanner(): void {
     ? `Refresh Capacity (${formatPaymentAmount(refreshAmount)})`
     : 'Capacity Full';
 
-  if (summary.tone === 'low') {
+  if (bannerEl && summary.tone === 'low') {
     bannerEl.style.display = '';
     bannerEl.innerHTML = `
       <div class="alert alert-warning" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
         <div>${escHtml(summary.message)}</div>
         <button class="btn btn-primary btn-sm" id="capacity-banner-refresh-btn" ${buttonDisabled}>${escHtml(buttonLabel)}</button>
       </div>`;
-  } else {
+  } else if (bannerEl) {
     bannerEl.style.display = 'none';
     bannerEl.innerHTML = '';
   }
 
-  statusAlertEl.innerHTML = `
-    <div class="alert ${summary.tone === 'low' ? 'alert-warning' : 'alert-info'}" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
-      <div>
-        ${escHtml(summary.message)}
-        <div style="font-size:12px;color:var(--muted);margin-top:4px">
-          Target receive capacity: ${escHtml(formatPaymentAmount(target))} (${getRemainingReceives(target)} message(s)).
-        </div>
-      </div>
-      <button class="btn btn-secondary btn-sm" id="status-capacity-refresh-btn" ${buttonDisabled}>${escHtml(buttonLabel)}</button>
-    </div>`;
+  if (statusAlertEl) {
+    statusAlertEl.innerHTML = summary.tone === 'low'
+      ? `
+        <div class="alert alert-warning">
+          ${escHtml(summary.message)}
+          <div style="font-size:12px;color:var(--muted);margin-top:4px">
+            Standard receive capacity is ${escHtml(formatPaymentAmount(target))} (${getRemainingReceives(target)} message(s)).
+          </div>
+        </div>`
+      : '';
+  }
 }
 
 function updateIdentityUI(): void {
@@ -2542,38 +2658,51 @@ function updateIdentityUI(): void {
 
   const tapEl = document.getElementById('status-tap-info');
   if (!tapEl) return;
-  if (pipeState.nonce > 0n || pipeState.myBalance > 0n) {
-    const sendTarget = getOpenTapAmount();
-    const receiveTarget = getTargetReceiveLiquidity();
-    const remainingReceives = getRemainingReceives(pipeState.serverBalance);
-    tapEl.innerHTML = `
-      <div style="font-size:11px;color:var(--muted);margin-top:4px;margin-bottom:8px">
-        Send capacity is the balance you can spend toward the reservoir. Receive liquidity is the reservoir balance it can forward to you when others send mail. Effective liquidity shown below includes pending channel balance when available.
-      </div>
-      <div style="font-size:11px;color:var(--muted);margin-top:2px;margin-bottom:8px">
-        Mailbox policy: open with ${escHtml(formatPaymentAmount(sendTarget))} send capacity and target ${escHtml(formatPaymentAmount(receiveTarget))} receive liquidity. Current receive headroom is about ${remainingReceives} message(s).
-      </div>
-      ${serverStatus.runtimeSettings && typeof (serverStatus.runtimeSettings as { maxBorrowPerTap?: unknown }).maxBorrowPerTap === 'string' ? `
-      <div style="font-size:11px;color:var(--muted);margin-top:2px;margin-bottom:8px">
-        Current receive-liquidity cap per tap: ${escHtml(formatPaymentAmount(String((serverStatus.runtimeSettings as { maxBorrowPerTap: string }).maxBorrowPerTap)))}
-      </div>` : ''}
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:4px">
-        <div>
-          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Send capacity</div>
-          <div style="font-size:15px;color:var(--text)">${escHtml(formatPaymentAmount(pipeState.myBalance))}</div>
-        </div>
-        <div>
-          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Receive liquidity</div>
-          <div style="font-size:15px;color:var(--text)">${escHtml(formatPaymentAmount(pipeState.serverBalance))}</div>
-        </div>
-        <div>
-          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Nonce</div>
-          <div style="font-size:15px;color:var(--text)">${pipeState.nonce}</div>
-        </div>
-      </div>`;
-  } else {
-    tapEl.textContent = 'No channel state loaded.';
+  const targetCapacity = getTargetReceiveLiquidity();
+  const messagePrice = getRuntimeMessagePrice();
+  const minFee = getRuntimeMinFee();
+  const recipientAmount = messagePrice > minFee ? messagePrice - minFee : 0n;
+  const networkNoteEl = document.getElementById('status-network-note') as HTMLElement | null;
+  const priceTotalEl = document.getElementById('status-price-total') as HTMLElement | null;
+  const priceRecipientEl = document.getElementById('status-price-recipient') as HTMLElement | null;
+  const priceFeeEl = document.getElementById('status-price-fee') as HTMLElement | null;
+
+  if (priceTotalEl) priceTotalEl.textContent = formatPaymentAmount(messagePrice);
+  if (priceRecipientEl) priceRecipientEl.textContent = formatPaymentAmount(recipientAmount);
+  if (priceFeeEl) priceFeeEl.textContent = formatPaymentAmount(minFee);
+  if (networkNoteEl) {
+    const network = typeof serverStatus.network === 'string'
+      ? serverStatus.network.charAt(0).toUpperCase() + serverStatus.network.slice(1)
+      : 'Mainnet';
+    networkNoteEl.textContent = `${network} • Reservoir ${shortPrincipal(getRuntimeReservoirContract())}`;
   }
+
+  tapEl.innerHTML = `
+    ${renderCapacityBlock({
+      title: 'Send capacity',
+      subtitle: 'Messages you can pay to send right now.',
+      balance: pipeState.myBalance,
+      target: targetCapacity,
+      actionMarkup: `
+        <div class="form-group">
+          <label for="add-funds-amount-input">Amount to add</label>
+          <input type="text" id="add-funds-amount-input" placeholder="e.g. 10000" spellcheck="false" autocomplete="off" />
+        </div>
+        <button class="btn btn-secondary" id="add-funds-btn">Add Funds</button>
+      `,
+    })}
+    ${renderCapacityBlock({
+      title: 'Receive capacity',
+      subtitle: 'Messages others can send to you before a refresh.',
+      balance: pipeState.serverBalance,
+      target: targetCapacity,
+      actionMarkup: `
+        <div class="capacity-secondary" style="flex:1 1 220px;line-height:1.5">
+          The server provides a default receive capacity for your inbox. Each message you send also adds to your receive capacity, and refresh restores you to the standard target when needed.
+        </div>
+        <button class="btn btn-primary" id="refresh-capacity-btn">Refresh Capacity</button>
+      `,
+    })}`;
 }
 
 async function setBorrowRate(): Promise<void> {
@@ -2634,7 +2763,7 @@ async function setBorrowRate(): Promise<void> {
         </a>
       </div>`;
   } catch (e) {
-    const msg = typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error');
+    const msg = normalizeWalletPromptError(e, 'transaction').message || 'Unknown error';
     statusEl.innerHTML = `<div class="alert alert-error">${escHtml(msg)}</div>`;
   } finally {
     btn.disabled = false;
@@ -2700,7 +2829,7 @@ async function setReservoirAgent(): Promise<void> {
         </a>
       </div>`;
   } catch (e) {
-    const msg = typeof e === 'string' ? e : ((e as Error)?.message || (e as { reason?: string })?.reason || JSON.stringify(e) || 'Unknown error');
+    const msg = normalizeWalletPromptError(e, 'transaction').message || 'Unknown error';
     statusEl.innerHTML = `<div class="alert alert-error">${escHtml(msg)}</div>`;
   } finally {
     btn.disabled = false;
@@ -2853,8 +2982,6 @@ bindEvent('connect-wallet-main', 'click', connectWallet);
 bindEvent('disconnect-btn', 'click', disconnectWallet);
 bindEvent('open-mailbox-btn', 'click', openMailbox);
 bindEvent('check-tap-btn', 'click', checkTapAfterTx);
-bindEvent('add-funds-btn', 'click', addFundsToTap);
-bindEvent('refresh-capacity-btn', 'click', () => refreshReceiveCapacity());
 
 document.querySelectorAll<HTMLButtonElement>('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => showTab(btn.dataset.tab ?? ''));
@@ -2870,9 +2997,27 @@ bindEvent('admin-set-rate-btn', 'click', setBorrowRate);
 bindEvent('admin-save-settings-btn', 'click', saveAdminRuntimeSettings);
 document.addEventListener('click', async (event) => {
   const target = event.target as HTMLElement | null;
-  const button = target?.closest<HTMLButtonElement>('#capacity-banner-refresh-btn, #status-capacity-refresh-btn');
-  if (!button) return;
-  await refreshReceiveCapacity();
+  const copyButton = target?.closest<HTMLButtonElement>('button[data-copy-text]');
+  if (copyButton) {
+    event.preventDefault();
+    const text = copyButton.dataset.copyText ?? '';
+    const original = copyButton.textContent ?? 'Copy';
+    const ok = await copyToClipboard(text);
+    copyButton.textContent = ok ? 'Copied!' : 'Copy failed';
+    setTimeout(() => { copyButton.textContent = original; }, 1500);
+    return;
+  }
+  const refreshButton = target?.closest<HTMLButtonElement>('#capacity-banner-refresh-btn, #status-capacity-refresh-btn, #refresh-capacity-btn');
+  if (refreshButton) {
+    event.preventDefault();
+    await refreshReceiveCapacity();
+    return;
+  }
+  const addFundsButton = target?.closest<HTMLButtonElement>('#add-funds-btn');
+  if (addFundsButton) {
+    event.preventDefault();
+    await addFundsToTap();
+  }
 });
 bindEvent('inbox-list', 'click', async (event) => {
   const target = event.target as HTMLElement | null;
