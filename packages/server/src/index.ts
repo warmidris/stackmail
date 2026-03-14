@@ -35,7 +35,7 @@ function isStandardPrincipal(value: string): boolean {
 }
 
 function isContractPrincipal(value: string): boolean {
-  return /^S[PT][0-9A-Z]{1,39}\.[a-zA-Z][a-zA-Z0-9-]{0,39}$/.test(value);
+  return /^S[A-Z][0-9A-Z]{1,39}\.[a-zA-Z][a-zA-Z0-9-]{0,39}$/.test(value);
 }
 
 function isPrincipal(value: string): boolean {

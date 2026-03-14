@@ -107,7 +107,7 @@ function normalizeHex32(value: string): string {
 }
 
 function isContractPrincipal(value: string): boolean {
-  return /^S[PT][0-9A-Z]{39}\.[a-zA-Z][a-zA-Z0-9-]{0,39}$/.test(value);
+  return /^S[A-Z][0-9A-Z]{1,39}\.[a-zA-Z][a-zA-Z0-9-]{0,39}$/.test(value);
 }
 
 function chainIdToHiroApi(chainId: number): string {
