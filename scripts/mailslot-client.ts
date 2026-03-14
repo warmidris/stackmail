@@ -59,7 +59,7 @@ export const DEFAULTS = {
 
 export const MAILBOX_POLICY = {
   SEND_CAPACITY_MULTIPLIER: 10n,
-  TARGET_RECEIVE_CAPACITY_MULTIPLIER: 20n,
+  DEFAULT_RECEIVE_CAPACITY_MULTIPLIER: 20n,
   LOW_RECEIVE_CAPACITY_MULTIPLIER: 5n,
 } as const;
 
@@ -109,6 +109,7 @@ export interface ServerStatus {
   authAudience?: string;
   runtimeSettings?: {
     maxBorrowPerTap?: string;
+    receiveCapacityMultiplier?: number;
   };
 }
 
@@ -603,7 +604,7 @@ export function deriveMailboxCapacityPolicy(status: ServerStatus): {
   return {
     messagePrice,
     sendCapacityTarget: messagePrice * MAILBOX_POLICY.SEND_CAPACITY_MULTIPLIER,
-    receiveCapacityTarget: messagePrice * MAILBOX_POLICY.TARGET_RECEIVE_CAPACITY_MULTIPLIER,
+    receiveCapacityTarget: messagePrice * BigInt(status.runtimeSettings?.receiveCapacityMultiplier ?? MAILBOX_POLICY.DEFAULT_RECEIVE_CAPACITY_MULTIPLIER),
     lowReceiveThreshold: messagePrice * MAILBOX_POLICY.LOW_RECEIVE_CAPACITY_MULTIPLIER,
   };
 }

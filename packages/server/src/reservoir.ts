@@ -83,7 +83,6 @@ interface PendingLeg {
   burnHeight: bigint | null;
 }
 
-const TARGET_RECEIVE_CAPACITY_MULTIPLIER = 20n;
 
 function serializePrincipalForSort(principal: string): Buffer {
   return Buffer.from(serializeCVBytes(principalCV(principal)));
@@ -1643,7 +1642,7 @@ export class ReservoirService {
     }
     const settings = this.settings.get();
     const maxBorrowPerTap = BigInt(settings.maxBorrowPerTap);
-    const targetReceiveLiquidity = BigInt(settings.messagePriceSats) * TARGET_RECEIVE_CAPACITY_MULTIPLIER;
+    const targetReceiveLiquidity = BigInt(settings.messagePriceSats) * BigInt(settings.receiveCapacityMultiplier);
     if (targetReceiveLiquidity > maxBorrowPerTap) {
       throw new ReservoirError(
         400,

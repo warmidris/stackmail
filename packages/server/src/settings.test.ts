@@ -26,6 +26,7 @@ const baseConfig: Config = {
   maxDeferredGlobal: 200,
   deferredMessageTtlMs: 86_400_000,
   maxBorrowPerTap: '100000',
+  receiveCapacityMultiplier: 20,
   refreshCapacityCooldownMs: 86_400_000,
   inboxSessionTtlMs: 300_000,
   allowedOrigins: [],

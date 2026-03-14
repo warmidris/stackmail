@@ -11,7 +11,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join, dirname, resolve } from 'node:path';
 
-import type { Config, RuntimeSettings } from './types.js';
+import type { Config, RuntimeSettings, EncryptedMail } from './types.js';
 import type { MessageStore } from './store.js';
 import type { RuntimeSettingsStore } from './settings.js';
 import { PaymentError } from './payment.js';
@@ -333,6 +333,7 @@ export function createMailServer(
     if (parsed['maxDeferredGlobal'] != null) patch.maxDeferredGlobal = Number(parsed['maxDeferredGlobal']);
     if (parsed['deferredMessageTtlMs'] != null) patch.deferredMessageTtlMs = Number(parsed['deferredMessageTtlMs']);
     if (parsed['maxBorrowPerTap'] != null) patch.maxBorrowPerTap = String(parsed['maxBorrowPerTap']);
+    if (parsed['receiveCapacityMultiplier'] != null) patch.receiveCapacityMultiplier = Number(parsed['receiveCapacityMultiplier']);
     if (parsed['refreshCapacityCooldownMs'] != null) patch.refreshCapacityCooldownMs = Number(parsed['refreshCapacityCooldownMs']);
 
     try {
@@ -475,36 +476,23 @@ export function createMailServer(
     }
 
     const enc = data.encryptedPayload as {
+      v?: unknown;
+      epk?: unknown;
       iv?: unknown;
-      ephemeralPK?: unknown;
-      cipherText?: unknown;
-      mac?: unknown;
-      wasString?: unknown;
-      cipherTextEncoding?: unknown;
+      data?: unknown;
     };
     if (
+      enc.v !== 1 ||
+      typeof enc.epk !== 'string' ||
       typeof enc.iv !== 'string' ||
-      typeof enc.ephemeralPK !== 'string' ||
-      typeof enc.cipherText !== 'string' ||
-      typeof enc.mac !== 'string' ||
-      typeof enc.wasString !== 'boolean' ||
-      (enc.cipherTextEncoding != null && enc.cipherTextEncoding !== 'hex' && enc.cipherTextEncoding !== 'base64')
+      typeof enc.data !== 'string'
     ) {
-      return json(res, 400, { error: 'invalid-encrypted-payload', message: 'encryptedPayload must be a Stacks ECIES cipher object' });
+      return json(res, 400, { error: 'invalid-encrypted-payload', message: 'encryptedPayload must be a v1 ECIES cipher object with fields: v, epk, iv, data' });
     }
 
-    const encryptedPayload = enc as {
-      iv: string;
-      ephemeralPK: string;
-      cipherText: string;
-      mac: string;
-      wasString: boolean;
-      cipherTextEncoding?: 'hex' | 'base64';
-    };
+    const encryptedPayload = enc as EncryptedMail;
 
-    const encSize = encryptedPayload.cipherTextEncoding === 'base64'
-      ? Buffer.from(encryptedPayload.cipherText, 'base64').byteLength
-      : Buffer.byteLength(encryptedPayload.cipherText, 'hex') / 2;
+    const encSize = Buffer.byteLength(encryptedPayload.data, 'hex') / 2;
     if (encSize > config.maxEncryptedBytes) {
       return json(res, 413, { error: 'payload-too-large' });
     }
