@@ -916,6 +916,286 @@ describe('auth error cases', () => {
   });
 });
 
+describe('GET /tap/state', () => {
+  it('returns null tap when no tracked state exists', async () => {
+    paymentService.trackedTapState = null;
+
+    const authHeader = buildAuthHeader({
+      pubkey: recipientSignKeypair.compressedPubkeyHex,
+      action: 'get-inbox',
+      address: recipientAddress,
+      privateKey: recipientSignKeypair.privateKey,
+    });
+
+    const res = await rawJsonRequest(`${baseUrl}/tap/state`, {
+      method: 'GET',
+      headers: { 'x-mailslot-auth': authHeader },
+    });
+    expect(res.status).toBe(200);
+    const body = res.body as { ok: boolean; tap: unknown };
+    expect(body.ok).toBe(true);
+    expect(body.tap).toBeNull();
+  });
+
+  it('rejects unauthenticated requests', async () => {
+    const res = await rawJsonRequest(`${baseUrl}/tap/state`, { method: 'GET' });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('POST /tap/add-funds-params', () => {
+  it('returns 503 when createAddFundsParams is not implemented', async () => {
+    // Default MockPaymentService doesn't define createAddFundsParams
+    const res = await rawJsonRequest(`${baseUrl}/tap/add-funds-params`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        user: recipientAddress,
+        amount: '5000',
+        myBalance: '1000',
+        reservoirBalance: '9000',
+        nonce: '1',
+        mySignature: '0x' + '11'.repeat(65),
+      }),
+    });
+    expect(res.status).toBe(503);
+    const body = res.body as { error: string };
+    expect(body.error).toBe('tap-liquidity-management-unavailable');
+  });
+
+  it('returns signed params when service method is available', async () => {
+    const addFundsService = new MockPaymentService();
+    (addFundsService as unknown as Record<string, unknown>).createAddFundsParams = async () => ({
+      reservoirSignature: '0x' + 'ff'.repeat(65),
+    });
+    const addFundsStore = new SqliteMessageStore(':memory:');
+    await addFundsStore.init();
+    const { default: Database } = await import('better-sqlite3');
+    const addFundsDb = new Database(':memory:');
+    const addFundsSettings = new RuntimeSettingsStore(addFundsDb, runtimeSettingsFromConfig(serverConfig));
+    const addFundsServer = createMailServer(serverConfig, addFundsStore, addFundsService, addFundsSettings);
+    await new Promise<void>(r => addFundsServer.listen(0, '127.0.0.1', () => r()));
+    const addFundsUrl = `http://127.0.0.1:${(addFundsServer.address() as AddressInfo).port}`;
+
+    try {
+      const res = await rawJsonRequest(`${addFundsUrl}/tap/add-funds-params`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          user: recipientAddress,
+          amount: '5000',
+          myBalance: '1000',
+          reservoirBalance: '9000',
+          nonce: '1',
+          mySignature: '0x' + '11'.repeat(65),
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = res.body as { ok: boolean; reservoirSignature: string; amount: string };
+      expect(body.ok).toBe(true);
+      expect(body.reservoirSignature).toBe('0x' + 'ff'.repeat(65));
+      expect(body.amount).toBe('5000');
+    } finally {
+      await new Promise<void>((r, j) => addFundsServer.close(e => e ? j(e) : r()));
+    }
+  });
+
+  it('returns 400 for missing params', async () => {
+    const svc = new MockPaymentService();
+    (svc as unknown as Record<string, unknown>).createAddFundsParams = async () => ({
+      reservoirSignature: '0x' + 'ff'.repeat(65),
+    });
+    const s = new SqliteMessageStore(':memory:');
+    await s.init();
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const ss = new RuntimeSettingsStore(db, runtimeSettingsFromConfig(serverConfig));
+    const srv = createMailServer(serverConfig, s, svc, ss);
+    await new Promise<void>(r => srv.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    try {
+      const res = await rawJsonRequest(`${url}/tap/add-funds-params`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ user: recipientAddress }), // missing required fields
+      });
+      expect(res.status).toBe(400);
+      expect((res.body as { error: string }).error).toBe('invalid-params');
+    } finally {
+      await new Promise<void>((r, j) => srv.close(e => e ? j(e) : r()));
+    }
+  });
+});
+
+describe('POST /tap/borrow-more-params', () => {
+  it('returns 503 when createBorrowLiquidityParams is not implemented', async () => {
+    const res = await rawJsonRequest(`${baseUrl}/tap/borrow-more-params`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        borrower: recipientAddress,
+        borrowAmount: '1000',
+        myBalance: '1000',
+        reservoirBalance: '1000',
+        borrowNonce: '1',
+        mySignature: '0x' + '11'.repeat(65),
+      }),
+    });
+    expect(res.status).toBe(503);
+    expect((res.body as { error: string }).error).toBe('tap-liquidity-management-unavailable');
+  });
+
+  it('returns signed borrow params when available', async () => {
+    const svc = new MockPaymentService();
+    (svc as unknown as Record<string, unknown>).createBorrowLiquidityParams = async () => ({
+      borrowFee: '50',
+      reservoirSignature: '0x' + 'ee'.repeat(65),
+    });
+    const s = new SqliteMessageStore(':memory:');
+    await s.init();
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const ss = new RuntimeSettingsStore(db, runtimeSettingsFromConfig(serverConfig));
+    const srv = createMailServer(serverConfig, s, svc, ss);
+    await new Promise<void>(r => srv.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    try {
+      const res = await rawJsonRequest(`${url}/tap/borrow-more-params`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          borrower: recipientAddress,
+          borrowAmount: '1000',
+          myBalance: '1000',
+          reservoirBalance: '1000',
+          borrowNonce: '1',
+          mySignature: '0x' + '11'.repeat(65),
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = res.body as { ok: boolean; borrowFee: string; reservoirSignature: string };
+      expect(body.ok).toBe(true);
+      expect(body.borrowFee).toBe('50');
+      expect(body.reservoirSignature).toBe('0x' + 'ee'.repeat(65));
+    } finally {
+      await new Promise<void>((r, j) => srv.close(e => e ? j(e) : r()));
+    }
+  });
+});
+
+describe('POST /tap/sync-state', () => {
+  it('returns 503 when syncTapState is not implemented', async () => {
+    const authHeader = buildAuthHeader({
+      pubkey: recipientSignKeypair.compressedPubkeyHex,
+      action: 'get-inbox',
+      address: recipientAddress,
+      privateKey: recipientSignKeypair.privateKey,
+    });
+    const res = await rawJsonRequest(`${baseUrl}/tap/sync-state`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-mailslot-auth': authHeader,
+      },
+      body: JSON.stringify({
+        user: recipientAddress,
+        myBalance: '1000',
+        reservoirBalance: '9000',
+        nonce: '5',
+      }),
+    });
+    expect(res.status).toBe(503);
+    expect((res.body as { error: string }).error).toBe('tap-liquidity-management-unavailable');
+  });
+
+  it('syncs state for authenticated user', async () => {
+    const svc = new MockPaymentService();
+    let syncedArgs: Record<string, unknown> | null = null;
+    (svc as unknown as Record<string, unknown>).syncTapState = async (args: Record<string, unknown>) => {
+      syncedArgs = args;
+    };
+    const s = new SqliteMessageStore(':memory:');
+    await s.init();
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const ss = new RuntimeSettingsStore(db, runtimeSettingsFromConfig(serverConfig));
+    const srv = createMailServer(serverConfig, s, svc, ss);
+    await new Promise<void>(r => srv.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    try {
+      const authHeader = buildAuthHeader({
+        pubkey: recipientSignKeypair.compressedPubkeyHex,
+        action: 'get-inbox',
+        address: recipientAddress,
+        privateKey: recipientSignKeypair.privateKey,
+      });
+      const res = await rawJsonRequest(`${url}/tap/sync-state`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-mailslot-auth': authHeader,
+        },
+        body: JSON.stringify({
+          user: recipientAddress,
+          myBalance: '5000',
+          reservoirBalance: '5000',
+          nonce: '10',
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect((res.body as { ok: boolean }).ok).toBe(true);
+      expect(syncedArgs).not.toBeNull();
+      expect((syncedArgs as unknown as Record<string, unknown>).counterparty).toBe(recipientAddress);
+      expect((syncedArgs as unknown as Record<string, unknown>).userBalance).toBe('5000');
+      expect((syncedArgs as unknown as Record<string, unknown>).nonce).toBe('10');
+    } finally {
+      await new Promise<void>((r, j) => srv.close(e => e ? j(e) : r()));
+    }
+  });
+
+  it('rejects sync when user address does not match auth', async () => {
+    const svc = new MockPaymentService();
+    (svc as unknown as Record<string, unknown>).syncTapState = async () => {};
+    const s = new SqliteMessageStore(':memory:');
+    await s.init();
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const ss = new RuntimeSettingsStore(db, runtimeSettingsFromConfig(serverConfig));
+    const srv = createMailServer(serverConfig, s, svc, ss);
+    await new Promise<void>(r => srv.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    try {
+      const authHeader = buildAuthHeader({
+        pubkey: recipientSignKeypair.compressedPubkeyHex,
+        action: 'get-inbox',
+        address: recipientAddress,
+        privateKey: recipientSignKeypair.privateKey,
+      });
+      const res = await rawJsonRequest(`${url}/tap/sync-state`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-mailslot-auth': authHeader,
+        },
+        body: JSON.stringify({
+          user: 'SP_DIFFERENT_USER',
+          myBalance: '5000',
+          reservoirBalance: '5000',
+          nonce: '10',
+        }),
+      });
+      expect(res.status).toBe(403);
+      expect((res.body as { error: string }).error).toBe('auth-address-mismatch');
+    } finally {
+      await new Promise<void>((r, j) => srv.close(e => e ? j(e) : r()));
+    }
+  });
+});
+
 describe('tap borrow params endpoint', () => {
   it('returns 400 for missing params', async () => {
     const res = await fetch(`${baseUrl}/tap/borrow-params`, {
@@ -1237,6 +1517,134 @@ describe('per-sender HTLC cap', () => {
     expect(body.error).toBe('recipient-inbox-full');
 
     await new Promise<void>((r, j) => capServer.close(e => e ? j(e) : r()));
+  });
+});
+
+describe('deferred message expiration', () => {
+  it('expired deferred messages are cleaned up when recipient checks inbox', async () => {
+    const deferStore = new SqliteMessageStore(':memory:');
+    await deferStore.init();
+    const deferService = new MockPaymentService();
+    // Disable outgoing payment → messages will be deferred
+    deferService.outgoingPaymentEnabled = false;
+    const deferConfig: Config = {
+      ...serverConfig,
+      deferredMessageTtlMs: 1, // 1ms TTL — will expire immediately
+    };
+    const { default: Database } = await import('better-sqlite3');
+    const deferDb = new Database(':memory:');
+    const deferSettings = new RuntimeSettingsStore(deferDb, runtimeSettingsFromConfig(deferConfig));
+    const deferServer = createMailServer(deferConfig, deferStore, deferService, deferSettings);
+    await new Promise<void>(r => deferServer.listen(0, '127.0.0.1', () => r()));
+    const deferUrl = `http://127.0.0.1:${(deferServer.address() as AddressInfo).port}`;
+
+    try {
+      // Send a message — it will be deferred (no recipient tap)
+      const secretHex = randomBytes(32).toString('hex');
+      const hashedSecretHex = hashSecret(secretHex);
+      const enc = await encryptMail(
+        { v: 1, secret: secretHex, body: 'deferred test' },
+        recipientEncryptPubkeyHex,
+      );
+      const proof = JSON.stringify({
+        hashedSecret: hashedSecretHex,
+        forPrincipal: 'SP_SENDER',
+        amount: '1000',
+      });
+      const sendRes = await rawJsonRequest(`${deferUrl}/messages/${recipientAddress}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-x402-payment': proof,
+        },
+        body: JSON.stringify({ from: 'SP_SENDER', encryptedPayload: enc }),
+      });
+      expect(sendRes.status).toBe(202);
+      const sendBody = sendRes.body as { messageId: string; deferred?: boolean };
+      expect(sendBody.deferred).toBe(true);
+
+      // Verify it exists in the store as deferred
+      expect(await deferStore.countDeferredGlobal()).toBe(1);
+
+      // Small delay to ensure TTL passes
+      await new Promise(r => setTimeout(r, 10));
+
+      // Check inbox — this triggers activateDeferredMessages → expireDeferredMessages
+      const authHeader = buildAuthHeader({
+        pubkey: recipientSignKeypair.compressedPubkeyHex,
+        action: 'get-inbox',
+        address: recipientAddress,
+        privateKey: recipientSignKeypair.privateKey,
+      });
+      const inboxRes = await rawJsonRequest(`${deferUrl}/inbox`, {
+        method: 'GET',
+        headers: { 'x-mailslot-auth': authHeader },
+      });
+      expect(inboxRes.status).toBe(200);
+
+      // After inbox check, expired deferred messages should be cleaned up
+      expect(await deferStore.countDeferredGlobal()).toBe(0);
+    } finally {
+      await new Promise<void>((r, j) => deferServer.close(e => e ? j(e) : r()));
+    }
+  });
+
+  it('deferred messages within TTL are not expired', async () => {
+    const deferStore = new SqliteMessageStore(':memory:');
+    await deferStore.init();
+    const deferService = new MockPaymentService();
+    deferService.outgoingPaymentEnabled = false;
+    const deferConfig: Config = {
+      ...serverConfig,
+      deferredMessageTtlMs: 86_400_000, // 24h — won't expire
+    };
+    const { default: Database } = await import('better-sqlite3');
+    const deferDb = new Database(':memory:');
+    const deferSettings = new RuntimeSettingsStore(deferDb, runtimeSettingsFromConfig(deferConfig));
+    const deferServer = createMailServer(deferConfig, deferStore, deferService, deferSettings);
+    await new Promise<void>(r => deferServer.listen(0, '127.0.0.1', () => r()));
+    const deferUrl = `http://127.0.0.1:${(deferServer.address() as AddressInfo).port}`;
+
+    try {
+      const secretHex = randomBytes(32).toString('hex');
+      const hashedSecretHex = hashSecret(secretHex);
+      const enc = await encryptMail(
+        { v: 1, secret: secretHex, body: 'long TTL test' },
+        recipientEncryptPubkeyHex,
+      );
+      const proof = JSON.stringify({
+        hashedSecret: hashedSecretHex,
+        forPrincipal: 'SP_SENDER',
+        amount: '1000',
+      });
+      const sendRes = await rawJsonRequest(`${deferUrl}/messages/${recipientAddress}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-x402-payment': proof,
+        },
+        body: JSON.stringify({ from: 'SP_SENDER', encryptedPayload: enc }),
+      });
+      expect(sendRes.status).toBe(202);
+      expect(await deferStore.countDeferredGlobal()).toBe(1);
+
+      // Check inbox — should NOT expire the deferred message
+      const authHeader = buildAuthHeader({
+        pubkey: recipientSignKeypair.compressedPubkeyHex,
+        action: 'get-inbox',
+        address: recipientAddress,
+        privateKey: recipientSignKeypair.privateKey,
+      });
+      await rawJsonRequest(`${deferUrl}/inbox`, {
+        method: 'GET',
+        headers: { 'x-mailslot-auth': authHeader },
+      });
+
+      // Message should still be deferred
+      expect(await deferStore.countDeferredGlobal()).toBe(1);
+    } finally {
+      await new Promise<void>((r, j) => deferServer.close(e => e ? j(e) : r()));
+    }
   });
 });
 

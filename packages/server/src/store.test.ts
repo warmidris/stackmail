@@ -386,4 +386,80 @@ describe('SqliteMessageStore', () => {
     });
   });
 
+  describe('deferred message expiration', () => {
+    it('expires deferred messages past their TTL', async () => {
+      const store = makeStore();
+      await store.init();
+      const now = Date.now();
+      // Message that expired 1 second ago
+      await store.saveMessage(makeMessage({
+        to: 'SP1ALICE',
+        pendingPayment: null,
+        deliveryState: 'deferred',
+        deferredReason: 'no-recipient-tap',
+        deferredUntil: now - 1000,
+      }));
+      // Message that expires in the future
+      const futureMsg = makeMessage({
+        to: 'SP1ALICE',
+        pendingPayment: null,
+        deliveryState: 'deferred',
+        deferredReason: 'no-recipient-tap',
+        deferredUntil: now + 60_000,
+      });
+      await store.saveMessage(futureMsg);
+
+      const expired = await store.expireDeferredMessages(now);
+      expect(expired).toBe(1);
+      // Future message still exists
+      const remaining = await store.getMessage(futureMsg.id, 'SP1ALICE');
+      expect(remaining).not.toBeNull();
+      expect(remaining?.deliveryState).toBe('deferred');
+    });
+
+    it('does not expire non-deferred messages', async () => {
+      const store = makeStore();
+      await store.init();
+      const now = Date.now();
+      const readyMsg = makeMessage({ to: 'SP1ALICE', deliveryState: 'ready' });
+      await store.saveMessage(readyMsg);
+
+      const expired = await store.expireDeferredMessages(now);
+      expect(expired).toBe(0);
+      expect(await store.getMessage(readyMsg.id, 'SP1ALICE')).not.toBeNull();
+    });
+
+    it('returns 0 when no messages are expired', async () => {
+      const store = makeStore();
+      await store.init();
+      const expired = await store.expireDeferredMessages(Date.now());
+      expect(expired).toBe(0);
+    });
+
+    it('getDeferredMessagesForRecipient excludes expired messages', async () => {
+      const store = makeStore();
+      await store.init();
+      const now = Date.now();
+      // Expired
+      await store.saveMessage(makeMessage({
+        to: 'SP1ALICE',
+        pendingPayment: null,
+        deliveryState: 'deferred',
+        deferredReason: 'no-recipient-tap',
+        deferredUntil: now - 1000,
+      }));
+      // Not expired
+      await store.saveMessage(makeMessage({
+        to: 'SP1ALICE',
+        pendingPayment: null,
+        deliveryState: 'deferred',
+        deferredReason: 'no-recipient-tap',
+        deferredUntil: now + 60_000,
+      }));
+
+      const deferred = await store.getDeferredMessagesForRecipient('SP1ALICE', now, 50);
+      expect(deferred).toHaveLength(1);
+    });
+  });
+
 });
