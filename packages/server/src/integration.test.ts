@@ -1727,3 +1727,406 @@ describe('security hardening', () => {
     await new Promise<void>((r, j) => hookServer.close(e => e ? j(e) : r()));
   });
 });
+
+// ─── Rate limiting ──────────────────────────────────────────────────────────
+
+describe('rate limiting', () => {
+  it('enforces rate limits and returns 429 with Retry-After header', async () => {
+    const rlConfig: Config = {
+      ...serverConfig,
+      rateLimitSendMax: 2,
+      rateLimitWindowMs: 60_000,
+    };
+    const rlStore = new SqliteMessageStore(':memory:');
+    await rlStore.init();
+    const rlService = new MockPaymentService();
+    const { default: Database } = await import('better-sqlite3');
+    const rlDb = new Database(':memory:');
+    const rlSettings = new RuntimeSettingsStore(rlDb, runtimeSettingsFromConfig(rlConfig));
+    const rlServer = createMailServer(rlConfig, rlStore, rlService, rlSettings);
+    await new Promise<void>(r => rlServer.listen(0, '127.0.0.1', () => r()));
+    const rlUrl = `http://127.0.0.1:${(rlServer.address() as AddressInfo).port}`;
+
+    try {
+      const sendReq = () => rawJsonRequest(`${rlUrl}/messages/${recipientAddress}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}', // Will fail validation, but rate limit is checked first
+      });
+
+      // First two requests should pass rate limit (may fail with 400/402 — that's fine, not 429)
+      const r1 = await sendReq();
+      expect(r1.status).not.toBe(429);
+      const r2 = await sendReq();
+      expect(r2.status).not.toBe(429);
+
+      // Third should be rate limited
+      const r3 = await sendReq();
+      expect(r3.status).toBe(429);
+      expect((r3.body as { error: string; category: string }).error).toBe('rate-limit-exceeded');
+      expect((r3.body as { category: string }).category).toBe('send');
+    } finally {
+      await new Promise<void>((r, j) => rlServer.close(e => e ? j(e) : r()));
+    }
+  });
+
+  it('does not rate limit exempt paths like /health and /status', async () => {
+    const rlConfig: Config = {
+      ...serverConfig,
+      rateLimitMax: 1, // Very low limit
+    };
+    const rlStore = new SqliteMessageStore(':memory:');
+    await rlStore.init();
+    const rlService = new MockPaymentService();
+    const { default: Database } = await import('better-sqlite3');
+    const rlDb = new Database(':memory:');
+    const rlSettings = new RuntimeSettingsStore(rlDb, runtimeSettingsFromConfig(rlConfig));
+    const rlServer = createMailServer(rlConfig, rlStore, rlService, rlSettings);
+    await new Promise<void>(r => rlServer.listen(0, '127.0.0.1', () => r()));
+    const rlUrl = `http://127.0.0.1:${(rlServer.address() as AddressInfo).port}`;
+
+    try {
+      // Health and status should never be rate limited regardless of how many requests
+      for (let i = 0; i < 5; i++) {
+        const health = await rawJsonRequest(`${rlUrl}/health`, { method: 'GET' });
+        expect(health.status).toBe(200);
+        const status = await rawJsonRequest(`${rlUrl}/status`, { method: 'GET' });
+        expect(status.status).toBe(200);
+      }
+    } finally {
+      await new Promise<void>((r, j) => rlServer.close(e => e ? j(e) : r()));
+    }
+  });
+
+  it('applies auth rate limit category to inbox requests', async () => {
+    const rlConfig: Config = {
+      ...serverConfig,
+      rateLimitAuthMax: 2,
+    };
+    const rlStore = new SqliteMessageStore(':memory:');
+    await rlStore.init();
+    const rlService = new MockPaymentService();
+    const { default: Database } = await import('better-sqlite3');
+    const rlDb = new Database(':memory:');
+    const rlSettings = new RuntimeSettingsStore(rlDb, runtimeSettingsFromConfig(rlConfig));
+    const rlServer = createMailServer(rlConfig, rlStore, rlService, rlSettings);
+    await new Promise<void>(r => rlServer.listen(0, '127.0.0.1', () => r()));
+    const rlUrl = `http://127.0.0.1:${(rlServer.address() as AddressInfo).port}`;
+
+    try {
+      const authHeader = buildAuthHeader({
+        pubkey: recipientSignKeypair.compressedPubkeyHex,
+        action: 'get-inbox',
+        address: recipientAddress,
+        privateKey: recipientSignKeypair.privateKey,
+      });
+
+      // First two pass
+      for (let i = 0; i < 2; i++) {
+        const r = await rawJsonRequest(`${rlUrl}/inbox`, {
+          method: 'GET',
+          headers: { 'x-mailslot-auth': authHeader },
+        });
+        expect(r.status).toBe(200);
+      }
+
+      // Third is rate limited
+      const r3 = await rawJsonRequest(`${rlUrl}/inbox`, {
+        method: 'GET',
+        headers: { 'x-mailslot-auth': authHeader },
+      });
+      expect(r3.status).toBe(429);
+      expect((r3.body as { category: string }).category).toBe('auth');
+    } finally {
+      await new Promise<void>((r, j) => rlServer.close(e => e ? j(e) : r()));
+    }
+  });
+});
+
+// ─── Inbox query parameters ─────────────────────────────────────────────────
+
+describe('inbox query parameters', () => {
+  it('respects limit, before, and claimed query params', async () => {
+    const qStore = new SqliteMessageStore(':memory:');
+    await qStore.init();
+    const qService = new MockPaymentService();
+    const { default: Database } = await import('better-sqlite3');
+    const qDb = new Database(':memory:');
+    const qSettings = new RuntimeSettingsStore(qDb, runtimeSettingsFromConfig(serverConfig));
+    const qServer = createMailServer(serverConfig, qStore, qService, qSettings);
+    await new Promise<void>(r => qServer.listen(0, '127.0.0.1', () => r()));
+    const qUrl = `http://127.0.0.1:${(qServer.address() as AddressInfo).port}`;
+
+    try {
+      const now = Date.now();
+      // Seed messages at different times
+      const msg1 = makeMessage({ to: recipientAddress, sentAt: now - 3000, amount: '1000' });
+      const msg2 = makeMessage({ to: recipientAddress, sentAt: now - 2000, amount: '2000' });
+      const msg3 = makeMessage({ to: recipientAddress, sentAt: now - 1000, amount: '3000' });
+      await qStore.saveMessage(msg1);
+      await qStore.saveMessage(msg2);
+      await qStore.saveMessage(msg3);
+      // Claim msg1 and mark as settled
+      await qStore.claimMessage(msg1.id, recipientAddress);
+      // Mark settled state so it appears with claimed=true
+      qStore['assertDb']().prepare("UPDATE messages SET delivery_state = 'settled' WHERE id = ?").run(msg1.id);
+
+      const authHeader = buildAuthHeader({
+        pubkey: recipientSignKeypair.compressedPubkeyHex,
+        action: 'get-inbox',
+        address: recipientAddress,
+        privateKey: recipientSignKeypair.privateKey,
+      });
+
+      // Default: excludes claimed, returns all unclaimed
+      const defaultRes = await rawJsonRequest(`${qUrl}/inbox`, {
+        method: 'GET',
+        headers: { 'x-mailslot-auth': authHeader },
+      });
+      expect(defaultRes.status).toBe(200);
+      const defaultBody = defaultRes.body as { messages: Array<{ id: string }> };
+      expect(defaultBody.messages).toHaveLength(2);
+
+      // With claimed=true: includes settled messages
+      const claimedRes = await rawJsonRequest(`${qUrl}/inbox?claimed=true`, {
+        method: 'GET',
+        headers: { 'x-mailslot-auth': authHeader },
+      });
+      expect(claimedRes.status).toBe(200);
+      const claimedBody = claimedRes.body as { messages: Array<{ id: string }> };
+      expect(claimedBody.messages).toHaveLength(3);
+
+      // With limit=1: returns only 1 message (most recent)
+      const limitRes = await rawJsonRequest(`${qUrl}/inbox?limit=1`, {
+        method: 'GET',
+        headers: { 'x-mailslot-auth': authHeader },
+      });
+      expect(limitRes.status).toBe(200);
+      const limitBody = limitRes.body as { messages: Array<{ id: string; amount: string }> };
+      expect(limitBody.messages).toHaveLength(1);
+      expect(limitBody.messages[0].id).toBe(msg3.id); // most recent
+
+      // With before: pagination — only messages before msg3
+      const beforeRes = await rawJsonRequest(`${qUrl}/inbox?before=${msg3.sentAt}`, {
+        method: 'GET',
+        headers: { 'x-mailslot-auth': authHeader },
+      });
+      expect(beforeRes.status).toBe(200);
+      const beforeBody = beforeRes.body as { messages: Array<{ id: string }> };
+      expect(beforeBody.messages).toHaveLength(1); // only msg2 (msg1 is claimed)
+      expect(beforeBody.messages[0].id).toBe(msg2.id);
+    } finally {
+      await new Promise<void>((r, j) => qServer.close(e => e ? j(e) : r()));
+    }
+  });
+});
+
+// ─── GET /inbox/:id (single claimed message fetch) ──────────────────────────
+
+describe('GET /inbox/:id', () => {
+  it('returns a settled message for the recipient', async () => {
+    const gmStore = new SqliteMessageStore(':memory:');
+    await gmStore.init();
+    const gmService = new MockPaymentService();
+    const { default: Database } = await import('better-sqlite3');
+    const gmDb = new Database(':memory:');
+    const gmSettings = new RuntimeSettingsStore(gmDb, runtimeSettingsFromConfig(serverConfig));
+    const gmServer = createMailServer(serverConfig, gmStore, gmService, gmSettings);
+    await new Promise<void>(r => gmServer.listen(0, '127.0.0.1', () => r()));
+    const gmUrl = `http://127.0.0.1:${(gmServer.address() as AddressInfo).port}`;
+
+    try {
+      // Send and claim a message
+      const secretHex = randomBytes(32).toString('hex');
+      const hashedSecretHex = hashSecret(secretHex);
+      const enc = await encryptMail(
+        { v: 1, secret: secretHex, subject: 'fetch test', body: 'fetch me' },
+        recipientEncryptPubkeyHex,
+      );
+      const senderAddress = pubkeyToStxAddress(senderPubkeyHex);
+      const proof = JSON.stringify({
+        hashedSecret: hashedSecretHex,
+        forPrincipal: senderAddress,
+        amount: '1000',
+      });
+
+      const sendRes = await rawJsonRequest(`${gmUrl}/messages/${recipientAddress}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-x402-payment': proof,
+        },
+        body: JSON.stringify({ from: senderAddress, encryptedPayload: enc }),
+      });
+      expect(sendRes.status).toBe(200);
+      const msgId = (sendRes.body as { messageId: string }).messageId;
+
+      // Claim it
+      const claimAuth = buildAuthHeader({
+        pubkey: recipientSignKeypair.compressedPubkeyHex,
+        action: 'claim-message',
+        address: recipientAddress,
+        messageId: msgId,
+        privateKey: recipientSignKeypair.privateKey,
+      });
+      const claimRes = await rawJsonRequest(`${gmUrl}/inbox/${msgId}/claim`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-mailslot-auth': claimAuth,
+        },
+        body: JSON.stringify({ secret: secretHex }),
+      });
+      expect(claimRes.status).toBe(200);
+
+      // Now fetch the settled message
+      const getAuth = buildAuthHeader({
+        pubkey: recipientSignKeypair.compressedPubkeyHex,
+        action: 'get-message',
+        address: recipientAddress,
+        messageId: msgId,
+        privateKey: recipientSignKeypair.privateKey,
+      });
+      const getRes = await rawJsonRequest(`${gmUrl}/inbox/${msgId}`, {
+        method: 'GET',
+        headers: { 'x-mailslot-auth': getAuth },
+      });
+      expect(getRes.status).toBe(200);
+      const getBody = getRes.body as { message: { id: string; from: string; encryptedPayload: Record<string, unknown> } };
+      expect(getBody.message.id).toBe(msgId);
+      expect(getBody.message.from).toBe(senderAddress);
+      expect(getBody.message.encryptedPayload).toBeDefined();
+    } finally {
+      await new Promise<void>((r, j) => gmServer.close(e => e ? j(e) : r()));
+    }
+  });
+
+  it('returns 404 for unclaimed message', async () => {
+    const gmStore = new SqliteMessageStore(':memory:');
+    await gmStore.init();
+    const gmService = new MockPaymentService();
+    const { default: Database } = await import('better-sqlite3');
+    const gmDb = new Database(':memory:');
+    const gmSettings = new RuntimeSettingsStore(gmDb, runtimeSettingsFromConfig(serverConfig));
+    const gmServer = createMailServer(serverConfig, gmStore, gmService, gmSettings);
+    await new Promise<void>(r => gmServer.listen(0, '127.0.0.1', () => r()));
+    const gmUrl = `http://127.0.0.1:${(gmServer.address() as AddressInfo).port}`;
+
+    try {
+      // Send a message but don't claim it
+      const secretHex = randomBytes(32).toString('hex');
+      const enc = await encryptMail(
+        { v: 1, secret: secretHex, body: 'not claimed' },
+        recipientEncryptPubkeyHex,
+      );
+      const senderAddress = pubkeyToStxAddress(senderPubkeyHex);
+      const proof = JSON.stringify({
+        hashedSecret: hashSecret(secretHex),
+        forPrincipal: senderAddress,
+        amount: '1000',
+      });
+
+      const sendRes = await rawJsonRequest(`${gmUrl}/messages/${recipientAddress}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-x402-payment': proof,
+        },
+        body: JSON.stringify({ from: senderAddress, encryptedPayload: enc }),
+      });
+      expect(sendRes.status).toBe(200);
+      const msgId = (sendRes.body as { messageId: string }).messageId;
+
+      // Try to fetch — should 404 because not settled
+      const getAuth = buildAuthHeader({
+        pubkey: recipientSignKeypair.compressedPubkeyHex,
+        action: 'get-message',
+        address: recipientAddress,
+        messageId: msgId,
+        privateKey: recipientSignKeypair.privateKey,
+      });
+      const getRes = await rawJsonRequest(`${gmUrl}/inbox/${msgId}`, {
+        method: 'GET',
+        headers: { 'x-mailslot-auth': getAuth },
+      });
+      expect(getRes.status).toBe(404);
+      expect((getRes.body as { error: string }).error).toBe('not-found');
+    } finally {
+      await new Promise<void>((r, j) => gmServer.close(e => e ? j(e) : r()));
+    }
+  });
+
+  it('returns 404 for nonexistent message', async () => {
+    const getAuth = buildAuthHeader({
+      pubkey: recipientSignKeypair.compressedPubkeyHex,
+      action: 'get-message',
+      address: recipientAddress,
+      messageId: 'nonexistent-id',
+      privateKey: recipientSignKeypair.privateKey,
+    });
+    const res = await rawJsonRequest(`${baseUrl}/inbox/nonexistent-id`, {
+      method: 'GET',
+      headers: { 'x-mailslot-auth': getAuth },
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+// ─── GET /payment-info/:addr ─────────────────────────────────────────────────
+
+describe('GET /payment-info/:addr', () => {
+  it('returns 404 for unregistered recipient', async () => {
+    const res = await rawJsonRequest(`${baseUrl}/payment-info/SP_UNREGISTERED_ADDRESS`, {
+      method: 'GET',
+    });
+    expect(res.status).toBe(404);
+    expect((res.body as { error: string }).error).toBe('recipient-not-found');
+  });
+});
+
+// ─── Payment service error propagation ──────────────────────────────────────
+
+describe('payment service error propagation', () => {
+  it('propagates typed payment service errors with correct status codes', async () => {
+    const errService = new MockPaymentService();
+    // Override createTapWithBorrowedLiquidityParams to throw a typed error
+    errService.createTapWithBorrowedLiquidityParams = async () => {
+      const err = Object.assign(new Error('insufficient liquidity'), {
+        statusCode: 409,
+        reason: 'insufficient-server-balance',
+      });
+      throw err;
+    };
+    const errStore = new SqliteMessageStore(':memory:');
+    await errStore.init();
+    const { default: Database } = await import('better-sqlite3');
+    const errDb = new Database(':memory:');
+    const errSettings = new RuntimeSettingsStore(errDb, runtimeSettingsFromConfig(serverConfig));
+    const errServer = createMailServer(serverConfig, errStore, errService, errSettings);
+    await new Promise<void>(r => errServer.listen(0, '127.0.0.1', () => r()));
+    const errUrl = `http://127.0.0.1:${(errServer.address() as AddressInfo).port}`;
+
+    try {
+      const res = await rawJsonRequest(`${errUrl}/tap/borrow-params`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          borrower: recipientAddress,
+          tapAmount: '1000',
+          tapNonce: '0',
+          borrowAmount: '1000',
+          myBalance: '1000',
+          reservoirBalance: '1000',
+          borrowNonce: '1',
+          mySignature: '0x' + '11'.repeat(65),
+        }),
+      });
+      expect(res.status).toBe(409);
+      const body = res.body as { error: string; message: string };
+      expect(body.error).toBe('insufficient-server-balance');
+      expect(body.message).toBe('insufficient liquidity');
+    } finally {
+      await new Promise<void>((r, j) => errServer.close(e => e ? j(e) : r()));
+    }
+  });
+});
