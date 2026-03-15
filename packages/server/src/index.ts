@@ -7,12 +7,13 @@ import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { createHash } from 'node:crypto';
+import { deserializeCV, ClarityType } from '@stacks/transactions';
 
 import { loadConfig, runtimeSettingsFromConfig, type Config } from './types.js';
 import { SqliteMessageStore } from './store.js';
 import { ReservoirService } from './reservoir.js';
 import { createMailServer } from './app.js';
-import { pubkeyToStxAddress, hash160ToStxAddress } from './auth.js';
+import { pubkeyToStxAddress } from './auth.js';
 import { RuntimeSettingsStore } from './settings.js';
 
 type ServerIdentitySource = 'env' | 'db' | 'generated';
@@ -57,15 +58,15 @@ function normalizeContractPrincipal(value: string): string | null {
  */
 function parseOptionalContractPrincipal(hex: string): string | null {
   if (!hex || !hex.startsWith('0x')) return null;
-  const buf = Buffer.from(hex.slice(2), 'hex');
-  // Expected: 0a (some) 06 (contract principal) version(1) hash160(20) nameLen(1) name(N)
-  if (buf[0] !== 0x0a || buf[1] !== 0x06) return null;
-  const version = buf[2];
-  const hash160 = buf.subarray(3, 23).toString('hex');
-  const nameLen = buf[23];
-  const contractName = buf.subarray(24, 24 + nameLen).toString('ascii');
-  const stxAddr = hash160ToStxAddress(hash160, version);
-  return `${stxAddr}.${contractName}`;
+  try {
+    const cv = deserializeCV(hex);
+    if (cv.type !== ClarityType.OptionalSome) return null;
+    const inner = cv.value;
+    if (inner.type !== ClarityType.PrincipalContract) return null;
+    return inner.value;
+  } catch {
+    return null;
+  }
 }
 
 function hiroApiForChain(chainId: number): string {
