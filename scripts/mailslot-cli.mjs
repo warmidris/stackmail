@@ -29,6 +29,8 @@ const {
   getTapState,
   keypairFromPrivkey,
   prepareBorrowMoreLiquidity,
+  prepareOpenMailbox,
+  registerMailbox,
   sendMessage,
   syncTapState,
   deriveMailboxCapacityPolicy,
@@ -41,6 +43,7 @@ function usage() {
   console.log(`Mailslot CLI
 
 Human commands:
+  mailslot open [--server <url>]
   mailslot inbox [--server <url>] [--claimed]
   mailslot compose [--server <url>] [--to <address>] [--subject <subject>]
   mailslot read <message-id> [--server <url>]
@@ -49,6 +52,7 @@ Human commands:
   mailslot refresh-capacity [--server <url>] [--json]
 
 Agent/raw commands:
+  mailslot open --json
   mailslot inbox --json
   mailslot read <message-id> --json
   mailslot compose --to <address> --subject <subject> --body <text> --json
@@ -88,6 +92,11 @@ function normalizePrivateKey(input) {
   }
   if (/^[0-9a-fA-F]{64}$/.test(trimmed)) return trimmed.toLowerCase();
   throw new Error('Expected MAILSLOT_PRIVATE_KEY to be 64 hex chars or 66 chars ending in 01');
+}
+
+/** Return the 66-char compressed Stacks private key expected by makeContractCall. */
+function compressedSenderKey(hex64) {
+  return hex64 + '01';
 }
 
 function loadJsonConfig() {
@@ -523,7 +532,7 @@ async function refreshCapacity(ctx, options) {
   }
   const tx = await makeContractCall({
     network,
-    senderKey: ctx.privateKey,
+    senderKey: compressedSenderKey(ctx.privateKey),
     contractAddress,
     contractName,
     functionName: 'borrow-liquidity',
@@ -628,6 +637,109 @@ async function runInbox(ctx, options) {
   }
 }
 
+async function openMailboxCmd(ctx, options) {
+  if (ctx.tap) {
+    const msg = 'You already have a tap open on this server.';
+    if (options.json) {
+      console.log(JSON.stringify({ ok: false, error: 'tap-already-exists', message: msg }));
+    } else {
+      console.log(msg);
+      console.log('Run: mailslot status');
+    }
+    return;
+  }
+
+  const token = ctx.status.supportedToken ?? 'token';
+  const policy = deriveMailboxCapacityPolicy(ctx.status);
+
+  if (!options.json && process.stdin.isTTY && process.stdout.isTTY) {
+    console.log('\nOpen a new Mailslot mailbox');
+    printKv('Address', ctx.address);
+    printKv('Server', ctx.serverUrl);
+    printKv('Send capacity', formatAmount(policy.sendCapacityTarget.toString(), token));
+    printKv('Receive capacity', formatAmount(policy.receiveCapacityTarget.toString(), token));
+    printKv('Message price', formatAmount(policy.messagePrice.toString(), token));
+    console.log('');
+    console.log('This will:');
+    console.log(`  1. Deposit ${policy.sendCapacityTarget} ${token} into your send pipe`);
+    console.log(`  2. Borrow ${policy.receiveCapacityTarget} ${token} receive liquidity from the reservoir`);
+    console.log(`  3. A small borrow fee may apply`);
+    console.log('');
+    const approved = await confirmAction('Proceed?');
+    if (!approved) throw new Error('Cancelled');
+  }
+
+  console.log('Preparing open-mailbox parameters...');
+  const params = await prepareOpenMailbox(ctx.privateKey, ctx.serverUrl);
+
+  const network = createNetwork({ network: params.chainId === 1 ? 'mainnet' : 'testnet' });
+  const [contractAddress, contractName] = params.reservoirContract.split('.');
+  const borrowFee = BigInt(params.borrowFee);
+
+  if (!options.json && process.stdin.isTTY && process.stdout.isTTY) {
+    console.log('');
+    printKv('Contract', `${params.reservoirContract}::create-tap-with-borrowed-liquidity`);
+    printKv('Tap deposit', formatAmount(params.tapAmount, token));
+    printKv('Borrow amount', formatAmount(params.borrowAmount, token));
+    printKv('Borrow fee', formatAmount(params.borrowFee, token));
+    printKv('Total cost', formatAmount((BigInt(params.tapAmount) + borrowFee).toString(), token));
+    console.log('');
+    const approved = await confirmAction('Submit this transaction?');
+    if (!approved) throw new Error('Transaction cancelled');
+  }
+
+  console.log('Broadcasting transaction...');
+  const tx = await makeContractCall({
+    network,
+    senderKey: compressedSenderKey(ctx.privateKey),
+    contractAddress,
+    contractName,
+    functionName: 'create-tap-with-borrowed-liquidity',
+    functionArgs: [
+      principalCV(params.stackflowContract),
+      params.token == null ? noneCV() : someCV(principalCV(params.token)),
+      uintCV(BigInt(params.tapAmount)),
+      uintCV(0n),  // tap nonce
+      uintCV(BigInt(params.borrowAmount)),
+      uintCV(borrowFee),
+      uintCV(BigInt(params.myBalance)),
+      uintCV(BigInt(params.reservoirBalance)),
+      bufferCV(Buffer.from(String(params.mySignature).replace(/^0x/, ''), 'hex')),
+      bufferCV(Buffer.from(String(params.reservoirSignature).replace(/^0x/, ''), 'hex')),
+      uintCV(BigInt(params.borrowNonce)),
+    ],
+    anchorMode: AnchorMode.Any,
+    postConditionMode: PostConditionMode.Allow,
+    validateWithAbi: false,
+  });
+  const result = await broadcastTransaction({ transaction: tx, network });
+  if ('reason' in result) {
+    throw new Error(`Broadcast failed: ${result.reason}${result.error ? ` (${result.error})` : ''}`);
+  }
+
+  // Register mailbox (store pubkey with server)
+  await registerMailbox(ctx.privateKey, ctx.serverUrl);
+
+  const payload = {
+    ok: true,
+    txid: result.txid,
+    tapAmount: params.tapAmount,
+    borrowAmount: params.borrowAmount,
+    borrowFee: params.borrowFee,
+  };
+
+  if (options.json) {
+    console.log(JSON.stringify(payload, null, 2));
+  } else {
+    console.log(`\nMailbox opened!`);
+    console.log(`Txid: ${result.txid}`);
+    console.log(`Tap deposit: ${formatAmount(params.tapAmount, token)}`);
+    console.log(`Receive liquidity: ${formatAmount(params.borrowAmount, token)}`);
+    console.log(`Borrow fee: ${formatAmount(params.borrowFee, token)}`);
+    console.log(`\nWait for transaction confirmation, then run: mailslot status`);
+  }
+}
+
 async function main() {
   const { command, options, positionals } = parseArgs(process.argv.slice(2));
   if (!command || command === 'help' || command === '--help') {
@@ -639,6 +751,11 @@ async function main() {
 
   if (command === 'status') {
     await printStatus(ctx);
+    return;
+  }
+
+  if (command === 'open') {
+    await openMailboxCmd(ctx, options);
     return;
   }
 

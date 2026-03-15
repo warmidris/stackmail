@@ -82,6 +82,7 @@ const testConfig: Config = {
   rateLimitSendMax: 20,
   rateLimitAdminMax: 10,
   enableBrowserDecryptKey: false,
+  supportedToken: '',
 };
 
 /** Minimal in-memory MessageStore stub. */

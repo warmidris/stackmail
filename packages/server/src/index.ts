@@ -52,6 +52,29 @@ function normalizeContractPrincipal(value: string): string | null {
 }
 
 /**
+ * Parse a Clarity serialized `(optional principal)` data var response into
+ * a contract principal string, or null if the value is `none` or malformed.
+ */
+function parseOptionalContractPrincipal(hex: string): string | null {
+  if (!hex || !hex.startsWith('0x')) return null;
+  const buf = Buffer.from(hex.slice(2), 'hex');
+  // Expected: 0a (some) 06 (contract principal) version(1) hash160(20) nameLen(1) name(N)
+  if (buf[0] !== 0x0a || buf[1] !== 0x06) return null;
+  const version = buf[2];
+  const hash160 = buf.subarray(3, 23).toString('hex');
+  const nameLen = buf[23];
+  const contractName = buf.subarray(24, 24 + nameLen).toString('ascii');
+  const stxAddr = hash160ToStxAddress(hash160, version);
+  return `${stxAddr}.${contractName}`;
+}
+
+function hiroApiForChain(chainId: number): string {
+  return chainId === 1
+    ? 'https://api.mainnet.hiro.so'
+    : 'https://api.testnet.hiro.so';
+}
+
+/**
  * Fetch the `stackflow-contract` data var from the reservoir contract on-chain.
  * Returns the contract principal string (e.g. "SP...sm-stackflow") or null.
  */
@@ -61,29 +84,33 @@ async function fetchSfContractFromReservoir(
 ): Promise<string | null> {
   const [addr, name] = reservoirContractId.split('.');
   if (!addr || !name) return null;
-
-  const api = chainId === 1
-    ? 'https://api.mainnet.hiro.so'
-    : 'https://api.testnet.hiro.so';
-  const url = `${api}/v2/data_var/${addr}/${name}/stackflow-contract`;
-
+  const url = `${hiroApiForChain(chainId)}/v2/data_var/${addr}/${name}/stackflow-contract`;
   try {
     const res = await fetch(url);
     if (!res.ok) return null;
     const json = await res.json() as { data?: string };
-    const hex = json.data;
-    if (!hex || !hex.startsWith('0x')) return null;
+    return parseOptionalContractPrincipal(json.data ?? '');
+  } catch {
+    return null;
+  }
+}
 
-    const buf = Buffer.from(hex.slice(2), 'hex');
-    // Expected: 0a (some) 06 (contract principal) version(1) hash160(20) nameLen(1) name(N)
-    if (buf[0] !== 0x0a || buf[1] !== 0x06) return null;
-    const version = buf[2];
-    const hash160 = buf.subarray(3, 23).toString('hex');
-    const nameLen = buf[23];
-    const contractName = buf.subarray(24, 24 + nameLen).toString('ascii');
-
-    const stxAddr = hash160ToStxAddress(hash160, version);
-    return `${stxAddr}.${contractName}`;
+/**
+ * Fetch the `supported-token` data var from the reservoir contract on-chain.
+ * Returns the SIP-010 contract principal string or null (meaning native STX).
+ */
+async function fetchSupportedTokenFromReservoir(
+  reservoirContractId: string,
+  chainId: number,
+): Promise<string | null> {
+  const [addr, name] = reservoirContractId.split('.');
+  if (!addr || !name) return null;
+  const url = `${hiroApiForChain(chainId)}/v2/data_var/${addr}/${name}/supported-token`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const json = await res.json() as { data?: string };
+    return parseOptionalContractPrincipal(json.data ?? '');
   } catch {
     return null;
   }
@@ -226,6 +253,14 @@ async function main(): Promise<void> {
   }
   if (!config.sfContractId) {
     console.warn('mailslot: MAILSLOT_SF_CONTRACT_ID not set and could not be discovered — outgoing payments disabled');
+  }
+
+  if (!config.supportedToken && config.reservoirContractId) {
+    const discoveredToken = await fetchSupportedTokenFromReservoir(config.reservoirContractId, config.chainId);
+    if (discoveredToken) {
+      config.supportedToken = discoveredToken;
+      console.log(`mailslot: discovered supported token from reservoir: ${discoveredToken}`);
+    }
   }
   if (!config.reservoirContractId) {
     console.warn('mailslot: reservoir contract not configured — tap onboarding disabled');

@@ -36,6 +36,7 @@ const baseConfig: Config = {
   rateLimitSendMax: 20,
   rateLimitAdminMax: 10,
   enableBrowserDecryptKey: false,
+  supportedToken: '',
 };
 
 describe('RuntimeSettingsStore', () => {

@@ -161,6 +161,8 @@ export interface Config {
   rateLimitAdminMax: number;
   enableBrowserDecryptKey: boolean;
   disputeWebhookToken?: string;
+  /** SIP-010 token contract principal, or null/empty for native STX */
+  supportedToken: string;
 }
 
 export interface RuntimeSettings {
@@ -247,5 +249,6 @@ export function loadConfig(): Config {
     rateLimitAdminMax: parseInt(process.env.MAILSLOT_RATE_LIMIT_ADMIN_MAX ?? '10', 10),
     enableBrowserDecryptKey: (process.env.MAILSLOT_ENABLE_BROWSER_DECRYPT_KEY ?? 'false').toLowerCase() === 'true',
     disputeWebhookToken: process.env.MAILSLOT_DISPUTE_WEBHOOK_TOKEN,
+    supportedToken: process.env.MAILSLOT_SUPPORTED_TOKEN ?? '',
   };
 }

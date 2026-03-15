@@ -258,6 +258,7 @@ const serverConfig: Config = {
   rateLimitSendMax: 20,
   rateLimitAdminMax: 10,
   enableBrowserDecryptKey: false,
+  supportedToken: '',
 };
 
 let server: Server;
@@ -575,15 +576,15 @@ describe('full send → inbox → preview → claim flow', () => {
     const stored = await store.getMessage(messageId, recipientAddress);
     expect(stored?.deliveryState).toBe('previewed');
     const enc = body.encryptedPayload as {
+      v: number;
+      epk: string;
       iv: string;
-      ephemeralPK: string;
-      cipherText: string;
-      mac: string;
-      wasString: boolean;
+      data: string;
     };
-    expect(typeof enc.ephemeralPK).toBe('string');
+    expect(enc.v).toBe(1);
+    expect(typeof enc.epk).toBe('string');
     expect(typeof enc.iv).toBe('string');
-    expect(typeof enc.cipherText).toBe('string');
+    expect(typeof enc.data).toBe('string');
   });
 
   it('step 5: POST /inbox/:id/claim with wrong secret returns 400', async () => {

@@ -1067,6 +1067,7 @@ export function createMailServer(
         authDomain: AUTH_DOMAIN,
         authAudience: getAuthAudience(config),
         enableBrowserDecryptKey: config.enableBrowserDecryptKey,
+        supportedToken: config.supportedToken || null,
         sfVersion: '0.6.0',
       });
     }

@@ -2,7 +2,7 @@
  * Mailslot TypeScript Client SDK
  *
  * Standalone client for the Mailslot mainnet deployment.
- * Copy this file into your project; it depends on @noble/curves and @stacks/encryption.
+ * Copy this file into your project; it depends on @noble/curves (for SIP-018 signing).
  *
  * ─── Mainnet Deployment ────────────────────────────────────────────────────────
  *
@@ -41,9 +41,8 @@
  *   console.log(messages[0].body);
  */
 
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createCipheriv, createDecipheriv, createECDH, hkdfSync, randomBytes } from 'node:crypto';
 import { secp256k1 } from '@noble/curves/secp256k1';
-import { decryptContent, encryptContent } from '@stacks/encryption';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -506,20 +505,62 @@ async function sip018Sign(
 
 // ─── ECIES Encryption ─────────────────────────────────────────────────────────
 
+const HKDF_SALT = Buffer.from('stackmail-v1', 'utf-8');
+const HKDF_INFO = Buffer.from('encrypt', 'utf-8');
+const AES_KEY_LEN = 32;
+const IV_LEN = 12;
+const AUTH_TAG_LEN = 16;
+
+function eciesDeriveKey(sharedSecret: Buffer): Buffer {
+  return Buffer.from(hkdfSync('sha256', sharedSecret, HKDF_SALT, HKDF_INFO, AES_KEY_LEN));
+}
+
 /** Encrypt a MailPayload for a recipient's compressed secp256k1 pubkey. */
-export async function encryptMail(payload: MailPayload, recipientPubkeyHex: string): Promise<EncryptedMail> {
-  const content = await encryptContent(JSON.stringify(payload), {
-    publicKey: recipientPubkeyHex.replace(/^0x/i, ''),
-  });
-  return JSON.parse(content) as EncryptedMail;
+export function encryptMail(payload: MailPayload, recipientPubkeyHex: string): EncryptedMail {
+  const recipientPubkey = Buffer.from(recipientPubkeyHex.replace(/^0x/i, ''), 'hex');
+  if (recipientPubkey.length !== 33) {
+    throw new TypeError(`recipientPubkey must be 33 bytes (compressed), got ${recipientPubkey.length}`);
+  }
+  const ecdh = createECDH('secp256k1');
+  ecdh.generateKeys();
+  const epk = ecdh.getPublicKey(undefined, 'compressed');
+  const sharedSecret = ecdh.computeSecret(recipientPubkey);
+  const key = eciesDeriveKey(sharedSecret);
+  const iv = randomBytes(IV_LEN);
+  const plaintext = Buffer.from(JSON.stringify(payload), 'utf-8');
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return {
+    v: 1,
+    epk: epk.toString('hex'),
+    iv: iv.toString('hex'),
+    data: Buffer.concat([ciphertext, authTag]).toString('hex'),
+  };
 }
 
 /** Decrypt an EncryptedMail using the recipient's secp256k1 private key (32 bytes hex). */
-export async function decryptMail(encrypted: EncryptedMail, privkeyHex: string): Promise<MailPayload> {
-  const plaintext = await decryptContent(JSON.stringify(encrypted), {
-    privateKey: privkeyHex.replace(/^0x/i, ''),
-  });
-  return JSON.parse(typeof plaintext === 'string' ? plaintext : Buffer.from(plaintext).toString('utf-8')) as MailPayload;
+export function decryptMail(encrypted: EncryptedMail, privkeyHex: string): MailPayload {
+  const privkey = Buffer.from(privkeyHex.replace(/^0x/i, ''), 'hex');
+  if (privkey.length !== 32) {
+    throw new TypeError(`privkey must be 32 bytes, got ${privkey.length}`);
+  }
+  const epk = Buffer.from(encrypted.epk, 'hex');
+  const iv = Buffer.from(encrypted.iv, 'hex');
+  const combined = Buffer.from(encrypted.data, 'hex');
+  if (epk.length !== 33) throw new TypeError('epk must be 33 bytes (compressed)');
+  if (iv.length !== IV_LEN) throw new TypeError(`iv must be ${IV_LEN} bytes`);
+  if (combined.length < AUTH_TAG_LEN) throw new TypeError('data too short');
+  const ecdh = createECDH('secp256k1');
+  ecdh.setPrivateKey(privkey);
+  const sharedSecret = ecdh.computeSecret(epk);
+  const key = eciesDeriveKey(sharedSecret);
+  const ciphertext = combined.subarray(0, combined.length - AUTH_TAG_LEN);
+  const authTag = combined.subarray(combined.length - AUTH_TAG_LEN);
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(authTag);
+  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return JSON.parse(plaintext.toString('utf-8')) as MailPayload;
 }
 
 /** Compute the HTLC hash: SHA-256 of the secret bytes. */
@@ -915,6 +956,96 @@ export async function syncTapState(
 }
 
 // ─── Public Client API ────────────────────────────────────────────────────────
+
+export interface OpenMailboxResult {
+  reservoirContract: string;
+  stackflowContract: string;
+  chainId: number;
+  token: string | null;
+  tapAmount: string;
+  borrowAmount: string;
+  borrowFee: string;
+  myBalance: string;
+  reservoirBalance: string;
+  borrowNonce: string;
+  mySignature: string;
+  reservoirSignature: string;
+}
+
+/**
+ * Prepare the parameters needed to open a new mailbox (create-tap-with-borrowed-liquidity).
+ *
+ * Signs the borrow state with the caller's key, requests the server's
+ * counter-signature, and returns everything needed to submit the on-chain tx.
+ *
+ * The caller is responsible for broadcasting the contract call.
+ */
+export async function prepareOpenMailbox(
+  privkeyHex: string,
+  serverUrl: string = DEFAULTS.SERVER_URL,
+): Promise<OpenMailboxResult> {
+  const kp = keypairFromPrivkey(privkeyHex);
+  const status = await getServerStatus(serverUrl);
+  const reservoir = resolveReservoirContract(status);
+  const sfContract = resolveSfContract(status);
+  const chainId = resolveChainId(status);
+  const token = await resolveSupportedToken(status, reservoir, chainId);
+
+  const policy = deriveMailboxCapacityPolicy(status);
+  const tapAmount = policy.sendCapacityTarget;
+  const borrowAmount = policy.receiveCapacityTarget;
+
+  const OPEN_TAP_NONCE = 0n;
+  const OPEN_BORROW_NONCE = 1n;
+
+  const pipeKey = canonicalPipeKey(token, kp.addr, reservoir);
+  const message = buildTransferMessage({
+    pipeKey,
+    forPrincipal: kp.addr,
+    myBalance: tapAmount.toString(),
+    theirBalance: borrowAmount.toString(),
+    nonce: OPEN_BORROW_NONCE.toString(),
+    action: '2',
+    actor: reservoir,
+    hashedSecret: null,
+    validAfter: null,
+  });
+  const mySignature = await sip018Sign(sfContract, message, privkeyHex, chainId);
+
+  const r = await http('POST', `${serverUrl}/tap/borrow-params`, {
+    borrower: kp.addr,
+    token,
+    tapAmount: tapAmount.toString(),
+    tapNonce: OPEN_TAP_NONCE.toString(),
+    borrowAmount: borrowAmount.toString(),
+    myBalance: tapAmount.toString(),
+    reservoirBalance: borrowAmount.toString(),
+    borrowNonce: OPEN_BORROW_NONCE.toString(),
+    mySignature,
+  });
+  if (!r.ok) {
+    const data = r.data as { error?: string; message?: string };
+    throw new Error(data.message || data.error || `prepareOpenMailbox failed: ${r.status}`);
+  }
+  const data = r.data as { reservoirSignature?: string; borrowFee?: string };
+  if (!data.reservoirSignature) throw new Error('Server did not return reservoir signature');
+  if (!data.borrowFee) throw new Error('Server did not return borrow fee');
+
+  return {
+    reservoirContract: reservoir,
+    stackflowContract: sfContract,
+    chainId,
+    token,
+    tapAmount: tapAmount.toString(),
+    borrowAmount: borrowAmount.toString(),
+    borrowFee: data.borrowFee,
+    myBalance: tapAmount.toString(),
+    reservoirBalance: borrowAmount.toString(),
+    borrowNonce: OPEN_BORROW_NONCE.toString(),
+    mySignature,
+    reservoirSignature: data.reservoirSignature,
+  };
+}
 
 /**
  * Register your mailbox with the server (one-time).
