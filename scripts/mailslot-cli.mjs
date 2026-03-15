@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import crypto from 'node:crypto';
 import readlinePromises from 'node:readline/promises';
 import { createNetwork } from '@stacks/network';
 import {
@@ -57,9 +58,10 @@ Agent/raw commands:
   mailslot read <message-id> --json
   mailslot compose --to <address> --subject <subject> --body <text> --json
 
-Auth:
-  export MAILSLOT_PRIVATE_KEY=<64-hex-or-66-char-stacks-key>
-  export MAILSLOT_PRIVATE_KEY_FILE=~/.config/mailslot/private-key
+Auth (in order of precedence):
+  1. export MAILSLOT_PRIVATE_KEY=<64-hex-or-66-char-stacks-key>
+  2. export MAILSLOT_PRIVATE_KEY_FILE=~/.config/mailslot/private-key
+  3. aibtc wallet (~/.aibtc/) — auto-detected, no config needed
 `);
 }
 
@@ -107,7 +109,58 @@ function loadJsonConfig() {
   }
 }
 
-function resolvePrivateKey(options) {
+/**
+ * Decrypt the aibtc keystore and derive the Stacks private key in-memory.
+ * Returns a 64-char hex private key, or null if no aibtc wallet is found.
+ */
+async function unlockAibtcWallet() {
+  const aibtcDir = path.join(os.homedir(), '.aibtc');
+  const configPath = path.join(aibtcDir, 'config.json');
+  if (!fs.existsSync(configPath)) return null;
+
+  const aibtcConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const walletId = aibtcConfig.activeWalletId;
+  if (!walletId) return null;
+
+  const keystorePath = path.join(aibtcDir, 'wallets', walletId, 'keystore.json');
+  if (!fs.existsSync(keystorePath)) return null;
+
+  // Read password from agent.env (agent name used as password by aibtc)
+  const agentEnvPath = path.join(aibtcDir, 'agent.env');
+  if (!fs.existsSync(agentEnvPath)) return null;
+  const password = fs.readFileSync(agentEnvPath, 'utf8').trim();
+
+  // Decrypt keystore: Scrypt KDF → AES-256-GCM
+  const keystore = JSON.parse(fs.readFileSync(keystorePath, 'utf8'));
+  const enc = keystore.encrypted;
+  const salt = Buffer.from(enc.salt, 'base64');
+  const derivedKey = crypto.scryptSync(password, salt, enc.scryptParams.keyLen, {
+    N: enc.scryptParams.N,
+    r: enc.scryptParams.r,
+    p: enc.scryptParams.p,
+  });
+  const decipher = crypto.createDecipheriv(
+    'aes-256-gcm',
+    derivedKey,
+    Buffer.from(enc.iv, 'base64'),
+  );
+  decipher.setAuthTag(Buffer.from(enc.authTag, 'base64'));
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(enc.ciphertext, 'base64')),
+    decipher.final(),
+  ]);
+  const mnemonic = decrypted.toString('utf8');
+
+  // Derive Stacks private key from mnemonic
+  const { generateWallet } = await import('@stacks/wallet-sdk');
+  const wallet = await generateWallet({ secretKey: mnemonic, password: '' });
+  const stxKey = wallet.accounts[0].stxPrivateKey;
+
+  // normalizePrivateKey strips the 01 suffix if present
+  return normalizePrivateKey(stxKey);
+}
+
+async function resolvePrivateKey(options) {
   const config = loadJsonConfig();
   const configuredPath = options['private-key-file'] ?? process.env.MAILSLOT_PRIVATE_KEY_FILE ?? config.privateKeyFile;
   const direct = options['private-key'] ?? process.env.MAILSLOT_PRIVATE_KEY ?? config.privateKey;
@@ -118,8 +171,14 @@ function resolvePrivateKey(options) {
       : configuredPath;
     return normalizePrivateKey(fs.readFileSync(expanded, 'utf8'));
   }
+
+  // Fall back to aibtc wallet
+  const aibtcKey = await unlockAibtcWallet();
+  if (aibtcKey) return aibtcKey;
+
   throw new Error(
-    `Missing private key. Set MAILSLOT_PRIVATE_KEY or MAILSLOT_PRIVATE_KEY_FILE.\n` +
+    `Missing private key. Set MAILSLOT_PRIVATE_KEY or MAILSLOT_PRIVATE_KEY_FILE,\n` +
+    `or install an aibtc wallet (~/.aibtc/).\n` +
     `Example:\n  export MAILSLOT_PRIVATE_KEY=<your-64-char-hex-key>`
   );
 }
@@ -445,7 +504,7 @@ async function renderMessageView(ctx, inboxEntry, message) {
 }
 
 async function fetchContext(options) {
-  const privateKey = resolvePrivateKey(options);
+  const privateKey = await resolvePrivateKey(options);
   const serverUrl = resolveServerUrl(options);
   const status = await getServerStatus(serverUrl);
   const kp = keypairFromPrivkey(privateKey);
