@@ -246,4 +246,21 @@ describe('inbox session tokens', () => {
     const tampered = `${payload}.AAAA`;
     expect(() => verifyInboxSessionToken(tampered, testConfig)).toThrow('invalid inbox session token');
   });
+
+  it('rejects expired tokens', () => {
+    const shortTtlConfig = { ...testConfig, inboxSessionTtlMs: -1 };
+    const token = issueInboxSessionToken('SP123SESSION', shortTtlConfig);
+    expect(() => verifyInboxSessionToken(token.token, shortTtlConfig)).toThrow('inbox session expired');
+  });
+
+  it('rejects malformed tokens without a separator', () => {
+    expect(() => verifyInboxSessionToken('no-dot-separator', testConfig)).toThrow('invalid inbox session token');
+  });
+
+  it('token address is preserved through issue/verify cycle', () => {
+    const addr = 'SP3HHD6N7SXNYF37GWT05DP51WVT8PRK0QYZQXW37';
+    const token = issueInboxSessionToken(addr, testConfig);
+    const payload = verifyInboxSessionToken(token.token, testConfig);
+    expect(payload.address).toBe(addr);
+  });
 });

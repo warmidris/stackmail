@@ -2130,3 +2130,171 @@ describe('payment service error propagation', () => {
     }
   });
 });
+
+// ─── Session token flow ─────────────────────────────────────────────────────
+
+describe('session token authentication', () => {
+  it('can use session token from first request to authenticate subsequent requests', async () => {
+    const authHeader = buildAuthHeader({
+      pubkey: recipientSignKeypair.compressedPubkeyHex,
+      action: 'get-inbox',
+      address: recipientAddress,
+      privateKey: recipientSignKeypair.privateKey,
+    });
+
+    // First request with full auth — get a session token back
+    const firstRes = await rawJsonRequest(`${baseUrl}/inbox`, {
+      method: 'GET',
+      headers: { 'x-mailslot-auth': authHeader },
+    });
+    expect(firstRes.status).toBe(200);
+
+    // Extract session token from response headers
+    // rawJsonRequest doesn't expose headers, so use Node http directly
+    const sessionToken = await new Promise<string>((resolve, reject) => {
+      const target = new URL(`${baseUrl}/inbox`);
+      const req = httpRequest({
+        hostname: target.hostname,
+        port: target.port,
+        path: target.pathname,
+        method: 'GET',
+        headers: { 'x-mailslot-auth': authHeader },
+      }, res => {
+        const token = res.headers['x-mailslot-session'] as string;
+        res.on('data', () => {});
+        res.on('end', () => resolve(token));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+
+    expect(sessionToken).toBeTruthy();
+
+    // Use session token for second request — no full auth needed
+    const sessionRes = await rawJsonRequest(`${baseUrl}/inbox`, {
+      method: 'GET',
+      headers: { 'x-mailslot-session': sessionToken },
+    });
+    expect(sessionRes.status).toBe(200);
+  });
+
+  it('rejects expired session tokens with 401', async () => {
+    // Create a server with very short session TTL
+    const shortConfig: Config = {
+      ...serverConfig,
+      inboxSessionTtlMs: -1, // Already expired
+    };
+    const shortStore = new SqliteMessageStore(':memory:');
+    await shortStore.init();
+    const shortService = new MockPaymentService();
+    const { default: Database } = await import('better-sqlite3');
+    const shortDb = new Database(':memory:');
+    const shortSettings = new RuntimeSettingsStore(shortDb, runtimeSettingsFromConfig(shortConfig));
+    const shortServer = createMailServer(shortConfig, shortStore, shortService, shortSettings);
+    await new Promise<void>(r => shortServer.listen(0, '127.0.0.1', () => r()));
+    const shortUrl = `http://127.0.0.1:${(shortServer.address() as AddressInfo).port}`;
+
+    try {
+      // Get a session token (it'll be issued already-expired)
+      const authHeader = buildAuthHeader({
+        pubkey: recipientSignKeypair.compressedPubkeyHex,
+        action: 'get-inbox',
+        address: recipientAddress,
+        privateKey: recipientSignKeypair.privateKey,
+      });
+
+      const sessionToken = await new Promise<string>((resolve, reject) => {
+        const target = new URL(`${shortUrl}/inbox`);
+        const req = httpRequest({
+          hostname: target.hostname,
+          port: target.port,
+          path: target.pathname,
+          method: 'GET',
+          headers: { 'x-mailslot-auth': authHeader },
+        }, res => {
+          const token = res.headers['x-mailslot-session'] as string;
+          res.on('data', () => {});
+          res.on('end', () => resolve(token));
+        });
+        req.on('error', reject);
+        req.end();
+      });
+
+      // Try using the expired token
+      const res = await rawJsonRequest(`${shortUrl}/inbox`, {
+        method: 'GET',
+        headers: { 'x-mailslot-session': sessionToken },
+      });
+      expect(res.status).toBe(401);
+      expect((res.body as { error: string }).error).toBe('session-expired');
+    } finally {
+      await new Promise<void>((r, j) => shortServer.close(e => e ? j(e) : r()));
+    }
+  });
+
+  it('rejects tampered session tokens with 401', async () => {
+    const res = await rawJsonRequest(`${baseUrl}/inbox`, {
+      method: 'GET',
+      headers: { 'x-mailslot-session': 'tampered.token' },
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+// ─── Body size and payment validation ───────────────────────────────────────
+
+describe('send message validation', () => {
+  it('returns 402 when no payment header is provided', async () => {
+    const res = await rawJsonRequest(`${baseUrl}/messages/${recipientAddress}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ from: 'SP_SENDER', encryptedPayload: {} }),
+    });
+    expect(res.status).toBe(402);
+    const body = res.body as { error: string; amount: string };
+    expect(body.error).toBe('payment-required');
+    expect(body.amount).toBe(serverConfig.messagePriceSats);
+  });
+
+  it('returns 413 when request body exceeds maxEncryptedBytes', async () => {
+    const tinyConfig: Config = {
+      ...serverConfig,
+      maxEncryptedBytes: 64, // Very small limit
+    };
+    const tinyStore = new SqliteMessageStore(':memory:');
+    await tinyStore.init();
+    const tinyService = new MockPaymentService();
+    const { default: Database } = await import('better-sqlite3');
+    const tinyDb = new Database(':memory:');
+    const tinySettings = new RuntimeSettingsStore(tinyDb, runtimeSettingsFromConfig(tinyConfig));
+    const tinyServer = createMailServer(tinyConfig, tinyStore, tinyService, tinySettings);
+    await new Promise<void>(r => tinyServer.listen(0, '127.0.0.1', () => r()));
+    const tinyUrl = `http://127.0.0.1:${(tinyServer.address() as AddressInfo).port}`;
+
+    try {
+      const secretHex = randomBytes(32).toString('hex');
+      const enc = await encryptMail(
+        { v: 1, secret: secretHex, body: 'A'.repeat(500) },
+        recipientEncryptPubkeyHex,
+      );
+      const senderAddress = pubkeyToStxAddress(senderPubkeyHex);
+      const proof = JSON.stringify({
+        hashedSecret: hashSecret(secretHex),
+        forPrincipal: senderAddress,
+        amount: '1000',
+      });
+      const res = await rawJsonRequest(`${tinyUrl}/messages/${recipientAddress}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-x402-payment': proof,
+        },
+        body: JSON.stringify({ from: senderAddress, encryptedPayload: enc }),
+      });
+      // Should be 413 (payload-too-large) — either from readBody limit or encSize check
+      expect(res.status).toBe(413);
+    } finally {
+      await new Promise<void>((r, j) => tinyServer.close(e => e ? j(e) : r()));
+    }
+  });
+});
