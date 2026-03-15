@@ -62,6 +62,18 @@ export interface MessageStore {
   countDeferredToRecipient(toAddr: string): Promise<number>;
   /** Count all deferred sender-paid messages on this server */
   countDeferredGlobal(): Promise<number>;
+
+  /** Aggregate stats for admin dashboard */
+  getStats(): Promise<{
+    totalMailboxes: number;
+    totalMessages: number;
+    messagesClaimed: number;
+    messagesUnclaimed: number;
+    totalVolume: string;
+    totalFees: string;
+    uniqueSenders: number;
+    uniqueRecipients: number;
+  }>;
 }
 
 // ─── SQLite implementation ────────────────────────────────────────────────────
@@ -478,6 +490,37 @@ export class SqliteMessageStore implements MessageStore {
       .prepare("SELECT COUNT(*) as cnt FROM messages WHERE claimed = 0 AND delivery_state = 'deferred'")
       .get() as { cnt: number };
     return row?.cnt ?? 0;
+  }
+
+  async getStats(): Promise<{
+    totalMailboxes: number;
+    totalMessages: number;
+    messagesClaimed: number;
+    messagesUnclaimed: number;
+    totalVolume: string;
+    totalFees: string;
+    uniqueSenders: number;
+    uniqueRecipients: number;
+  }> {
+    const db = this.assertDb();
+    const mailboxes = db.prepare("SELECT COUNT(*) as cnt FROM public_keys").get() as { cnt: number };
+    const total = db.prepare("SELECT COUNT(*) as cnt FROM messages").get() as { cnt: number };
+    const claimed = db.prepare("SELECT COUNT(*) as cnt FROM messages WHERE claimed = 1").get() as { cnt: number };
+    const unclaimed = db.prepare("SELECT COUNT(*) as cnt FROM messages WHERE claimed = 0").get() as { cnt: number };
+    const volume = db.prepare("SELECT COALESCE(SUM(CAST(amount AS INTEGER)), 0) as total FROM messages").get() as { total: number };
+    const fees = db.prepare("SELECT COALESCE(SUM(CAST(fee AS INTEGER)), 0) as total FROM messages").get() as { total: number };
+    const senders = db.prepare("SELECT COUNT(DISTINCT from_addr) as cnt FROM messages").get() as { cnt: number };
+    const recipients = db.prepare("SELECT COUNT(DISTINCT to_addr) as cnt FROM messages").get() as { cnt: number };
+    return {
+      totalMailboxes: mailboxes.cnt,
+      totalMessages: total.cnt,
+      messagesClaimed: claimed.cnt,
+      messagesUnclaimed: unclaimed.cnt,
+      totalVolume: volume.total.toString(),
+      totalFees: fees.total.toString(),
+      uniqueSenders: senders.cnt,
+      uniqueRecipients: recipients.cnt,
+    };
   }
 
   private rowToStored(row: Record<string, unknown>): StoredMessage {

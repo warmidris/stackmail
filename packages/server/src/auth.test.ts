@@ -112,6 +112,7 @@ function makeMockStore(): MessageStore {
     countDeferredFromSender: async () => 0,
     countDeferredToRecipient: async () => 0,
     countDeferredGlobal: async () => 0,
+    getStats: async () => ({ totalMailboxes: 0, totalMessages: 0, messagesClaimed: 0, messagesUnclaimed: 0, totalVolume: '0', totalFees: '0', uniqueSenders: 0, uniqueRecipients: 0 }),
   };
 }
 

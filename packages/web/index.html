@@ -590,6 +590,7 @@
     <button class="tab-btn active" data-tab="inbox">Inbox</button>
     <button class="tab-btn" data-tab="compose">Compose</button>
     <button class="tab-btn" data-tab="status">Status</button>
+    <button class="tab-btn" data-tab="admin" id="admin-tab-btn" style="display:none">Admin</button>
   </nav>
   <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
     <button class="btn btn-secondary btn-sm" id="connect-wallet-btn">Connect Wallet</button>
@@ -837,82 +838,93 @@
         </div>
         <div id="liquidity-status" style="margin-top:10px"></div>
 
-        <div id="admin-section" style="display:none">
-          <hr class="divider">
-          <div class="card-title">Reservoir Admin</div>
-          <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
-            Contract authorization is enforced on-chain by reservoir admin calls (`set-agent`, `set-borrow-rate`).
-          </div>
-          <div class="form-group" style="margin-bottom:10px">
-            <label for="admin-agent-input">Reservoir Agent Address</label>
-            <input type="text" id="admin-agent-input" placeholder="SP... (server signer address)" spellcheck="false" autocomplete="off" />
-            <div style="font-size:11px;color:var(--muted);margin-top:4px">
-              Required for reservoir signatures to validate on-chain. This is auto-filled from status when available.
-            </div>
-          </div>
-          <button class="btn btn-secondary" id="admin-set-agent-btn">Set Reservoir Agent</button>
-          <div id="admin-agent-status" style="margin-top:10px"></div>
-          <hr class="divider">
-          <div class="form-group" style="margin-bottom:10px">
-            <label for="admin-borrow-rate-input">Borrow Rate (basis points)</label>
-            <input type="text" id="admin-borrow-rate-input" placeholder="e.g. 100" spellcheck="false" autocomplete="off" />
-          </div>
-          <button class="btn btn-secondary" id="admin-set-rate-btn">Set Borrow Rate</button>
-          <div id="admin-rate-status" style="margin-top:10px"></div>
-          <hr class="divider">
-          <div class="card-title">Mailslot Runtime Settings</div>
-          <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
-            These values are stored server-side and applied immediately without restarting the process.
-          </div>
-          <div class="grid-2">
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-message-price-input">Message Price</label>
-              <input type="text" id="admin-message-price-input" spellcheck="false" autocomplete="off" />
-            </div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-min-fee-input">Minimum Fee</label>
-              <input type="text" id="admin-min-fee-input" spellcheck="false" autocomplete="off" />
-            </div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-max-pending-sender-input">Max Pending / Sender</label>
-              <input type="text" id="admin-max-pending-sender-input" spellcheck="false" autocomplete="off" />
-            </div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-max-pending-recipient-input">Max Pending / Recipient</label>
-              <input type="text" id="admin-max-pending-recipient-input" spellcheck="false" autocomplete="off" />
-            </div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-max-deferred-sender-input">Max Deferred / Sender</label>
-              <input type="text" id="admin-max-deferred-sender-input" spellcheck="false" autocomplete="off" />
-            </div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-max-deferred-recipient-input">Max Deferred / Recipient</label>
-              <input type="text" id="admin-max-deferred-recipient-input" spellcheck="false" autocomplete="off" />
-            </div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-max-deferred-global-input">Max Deferred / Global</label>
-              <input type="text" id="admin-max-deferred-global-input" spellcheck="false" autocomplete="off" />
-            </div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-deferred-ttl-input">Deferred TTL (ms)</label>
-              <input type="text" id="admin-deferred-ttl-input" spellcheck="false" autocomplete="off" />
-            </div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-max-borrow-per-tap-input">Max Borrow / Tap</label>
-              <input type="text" id="admin-max-borrow-per-tap-input" spellcheck="false" autocomplete="off" />
-            </div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-receive-capacity-multiplier-input">Receive Capacity Multiplier</label>
-              <input type="text" id="admin-receive-capacity-multiplier-input" spellcheck="false" autocomplete="off" />
-            </div>
-            <div class="form-group" style="margin-bottom:10px">
-              <label for="admin-refresh-capacity-cooldown-input">Refresh Capacity Cooldown (ms)</label>
-              <input type="text" id="admin-refresh-capacity-cooldown-input" spellcheck="false" autocomplete="off" />
-            </div>
-          </div>
-          <button class="btn btn-secondary" id="admin-save-settings-btn">Save Mailslot Settings</button>
-          <div id="admin-settings-status" style="margin-top:10px"></div>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="tab-admin">
+      <div class="card">
+        <div class="card-title">Server Stats</div>
+        <div id="admin-stats-container">
+          <div style="color:var(--muted)">Loading stats…</div>
         </div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <div class="card-title">Reservoir Admin</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
+          Contract authorization is enforced on-chain by reservoir admin calls (`set-agent`, `set-borrow-rate`).
+        </div>
+        <div class="form-group" style="margin-bottom:10px">
+          <label for="admin-agent-input">Reservoir Agent Address</label>
+          <input type="text" id="admin-agent-input" placeholder="SP... (server signer address)" spellcheck="false" autocomplete="off" />
+          <div style="font-size:11px;color:var(--muted);margin-top:4px">
+            Required for reservoir signatures to validate on-chain. This is auto-filled from status when available.
+          </div>
+        </div>
+        <button class="btn btn-secondary" id="admin-set-agent-btn">Set Reservoir Agent</button>
+        <div id="admin-agent-status" style="margin-top:10px"></div>
+        <hr class="divider">
+        <div class="form-group" style="margin-bottom:10px">
+          <label for="admin-borrow-rate-input">Borrow Rate (basis points)</label>
+          <input type="text" id="admin-borrow-rate-input" placeholder="e.g. 100" spellcheck="false" autocomplete="off" />
+        </div>
+        <button class="btn btn-secondary" id="admin-set-rate-btn">Set Borrow Rate</button>
+        <div id="admin-rate-status" style="margin-top:10px"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <div class="card-title">Mailslot Runtime Settings</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
+          These values are stored server-side and applied immediately without restarting the process.
+        </div>
+        <div class="grid-2">
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-message-price-input">Message Price</label>
+            <input type="text" id="admin-message-price-input" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-min-fee-input">Minimum Fee</label>
+            <input type="text" id="admin-min-fee-input" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-max-pending-sender-input">Max Pending / Sender</label>
+            <input type="text" id="admin-max-pending-sender-input" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-max-pending-recipient-input">Max Pending / Recipient</label>
+            <input type="text" id="admin-max-pending-recipient-input" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-max-deferred-sender-input">Max Deferred / Sender</label>
+            <input type="text" id="admin-max-deferred-sender-input" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-max-deferred-recipient-input">Max Deferred / Recipient</label>
+            <input type="text" id="admin-max-deferred-recipient-input" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-max-deferred-global-input">Max Deferred / Global</label>
+            <input type="text" id="admin-max-deferred-global-input" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-deferred-ttl-input">Deferred TTL (ms)</label>
+            <input type="text" id="admin-deferred-ttl-input" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-max-borrow-per-tap-input">Max Borrow / Tap</label>
+            <input type="text" id="admin-max-borrow-per-tap-input" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-receive-capacity-multiplier-input">Receive Capacity Multiplier</label>
+            <input type="text" id="admin-receive-capacity-multiplier-input" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:10px">
+            <label for="admin-refresh-capacity-cooldown-input">Refresh Capacity Cooldown (ms)</label>
+            <input type="text" id="admin-refresh-capacity-cooldown-input" spellcheck="false" autocomplete="off" />
+          </div>
+        </div>
+        <button class="btn btn-secondary" id="admin-save-settings-btn">Save Mailslot Settings</button>
+        <div id="admin-settings-status" style="margin-top:10px"></div>
       </div>
     </div>
 

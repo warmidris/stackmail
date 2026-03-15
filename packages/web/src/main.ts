@@ -317,9 +317,9 @@ function browserDecryptFallbackEnabled(): boolean {
 }
 
 function updateAdminSectionVisibility(): void {
-  const section = document.getElementById('admin-section') as HTMLElement | null;
-  if (!section) return;
-  section.style.display = connectedUserIsReservoirAdmin() ? '' : 'none';
+  const tabBtn = document.getElementById('admin-tab-btn') as HTMLElement | null;
+  if (!tabBtn) return;
+  tabBtn.style.display = connectedUserIsReservoirAdmin() ? '' : 'none';
 }
 
 function updateBrowserDecryptFallbackVisibility(): void {
@@ -1062,8 +1062,16 @@ async function onWalletConnected(): Promise<void> {
   ).catch(() => null);
 
   if (!tap) {
-    (document.getElementById('onboarding-addr') as HTMLElement).textContent = walletAddress!;
-    setAppState('no-tap');
+    if (connectedUserIsReservoirAdmin()) {
+      // Admin doesn't need a payment pipe — go straight to ready
+      updateIdentityUI();
+      setAppState('ready');
+      showTab('admin');
+      loadAdminStats();
+    } else {
+      (document.getElementById('onboarding-addr') as HTMLElement).textContent = walletAddress!;
+      setAppState('no-tap');
+    }
   } else {
     pipeState = { myBalance: tap.userBalance, serverBalance: tap.reservoirBalance, nonce: tap.nonce };
     updateIdentityUI();
@@ -2923,6 +2931,39 @@ async function saveAdminRuntimeSettings(): Promise<void> {
 // Tab switching
 // ─────────────────────────────────────────────────────────────────────────────
 
+async function loadAdminStats(): Promise<void> {
+  const container = document.getElementById('admin-stats-container');
+  if (!container) return;
+  try {
+    const auth = await buildWalletAuthHeader('admin-settings');
+    const resp = await fetch('/admin/stats', { headers: { 'x-mailslot-auth': auth } });
+    if (!resp.ok) {
+      container.innerHTML = `<div style="color:var(--error)">Failed to load stats (${resp.status})</div>`;
+      return;
+    }
+    const data = await resp.json() as { stats: {
+      totalMailboxes: number; totalMessages: number;
+      messagesClaimed: number; messagesUnclaimed: number;
+      totalVolume: string; totalFees: string;
+      uniqueSenders: number; uniqueRecipients: number;
+    }};
+    const s = data.stats;
+    container.innerHTML = `
+      <div class="compact-stats">
+        <div class="compact-stat"><div class="compact-stat-value">${s.totalMailboxes}</div><div class="compact-stat-label">Mailboxes</div></div>
+        <div class="compact-stat"><div class="compact-stat-value">${s.totalMessages}</div><div class="compact-stat-label">Messages</div></div>
+        <div class="compact-stat"><div class="compact-stat-value">${s.messagesClaimed}</div><div class="compact-stat-label">Claimed</div></div>
+        <div class="compact-stat"><div class="compact-stat-value">${s.messagesUnclaimed}</div><div class="compact-stat-label">Unclaimed</div></div>
+        <div class="compact-stat"><div class="compact-stat-value">${s.uniqueSenders}</div><div class="compact-stat-label">Unique Senders</div></div>
+        <div class="compact-stat"><div class="compact-stat-value">${s.uniqueRecipients}</div><div class="compact-stat-label">Unique Recipients</div></div>
+        <div class="compact-stat"><div class="compact-stat-value">${s.totalVolume}</div><div class="compact-stat-label">Total Volume (sats)</div></div>
+        <div class="compact-stat"><div class="compact-stat-value">${s.totalFees}</div><div class="compact-stat-label">Total Fees (sats)</div></div>
+      </div>`;
+  } catch (err) {
+    container.innerHTML = `<div style="color:var(--error)">Error loading stats</div>`;
+  }
+}
+
 function showTab(name: string): void {
   document.querySelectorAll<HTMLElement>('.tab-btn').forEach(b =>
     b.classList.toggle('active', (b as HTMLElement & { dataset: { tab?: string } }).dataset.tab === name));
@@ -2930,6 +2971,7 @@ function showTab(name: string): void {
     p.classList.toggle('active', p.id === `tab-${name}`));
   if (name === 'inbox')  loadInbox();
   if (name === 'status') loadStatus();
+  if (name === 'admin')  loadAdminStats();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

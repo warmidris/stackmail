@@ -305,6 +305,13 @@ export function createMailServer(
     return json(res, 200, { ok: true, admin, settings: currentSettings() });
   }
 
+  async function handleGetAdminStats(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const admin = await requireAdminAuth(req, res);
+    if (!admin) return;
+    const stats = await store.getStats();
+    return json(res, 200, { ok: true, admin, stats });
+  }
+
   async function handleUpdateAdminSettings(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const admin = await requireAdminAuth(req, res);
     if (!admin) return;
@@ -1086,6 +1093,10 @@ export function createMailServer(
 
     if (method === 'POST' && path === '/admin/settings') {
       return handleUpdateAdminSettings(req, res);
+    }
+
+    if (method === 'GET' && path === '/admin/stats') {
+      return handleGetAdminStats(req, res);
     }
 
     const paymentInfoMatch = path.match(/^\/payment-info\/([^/]+)$/);
