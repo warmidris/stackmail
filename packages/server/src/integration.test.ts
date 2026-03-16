@@ -1085,6 +1085,114 @@ describe('POST /tap/borrow-more-params', () => {
   });
 });
 
+describe('POST /tap/withdraw-params', () => {
+  it('returns 503 when createWithdrawFundsParams is not implemented', async () => {
+    const res = await rawJsonRequest(`${baseUrl}/tap/withdraw-params`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        user: recipientAddress,
+        amount: '1000',
+        myBalance: '4000',
+        reservoirBalance: '6000',
+        nonce: '2',
+        mySignature: '0x' + '11'.repeat(65),
+      }),
+    });
+    expect(res.status).toBe(503);
+    expect((res.body as { error: string }).error).toBe('tap-liquidity-management-unavailable');
+  });
+
+  it('returns signed withdraw params when available', async () => {
+    const svc = new MockPaymentService();
+    (svc as unknown as Record<string, unknown>).createWithdrawFundsParams = async () => ({
+      reservoirSignature: '0x' + 'ab'.repeat(65),
+    });
+    const s = new SqliteMessageStore(':memory:');
+    await s.init();
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const ss = new RuntimeSettingsStore(db, runtimeSettingsFromConfig(serverConfig));
+    const srv = createMailServer(serverConfig, s, svc, ss);
+    await new Promise<void>(r => srv.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    try {
+      const res = await rawJsonRequest(`${url}/tap/withdraw-params`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          user: recipientAddress,
+          amount: '1000',
+          myBalance: '4000',
+          reservoirBalance: '6000',
+          nonce: '2',
+          mySignature: '0x' + '11'.repeat(65),
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = res.body as { ok: boolean; reservoirSignature: string };
+      expect(body.ok).toBe(true);
+      expect(body.reservoirSignature).toBe('0x' + 'ab'.repeat(65));
+    } finally {
+      await new Promise<void>((r, j) => srv.close(e => e ? j(e) : r()));
+    }
+  });
+});
+
+describe('POST /tap/close-params', () => {
+  it('returns 503 when createCloseTapParams is not implemented', async () => {
+    const res = await rawJsonRequest(`${baseUrl}/tap/close-params`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        user: recipientAddress,
+        myBalance: '4000',
+        reservoirBalance: '6000',
+        nonce: '2',
+        mySignature: '0x' + '11'.repeat(65),
+      }),
+    });
+    expect(res.status).toBe(503);
+    expect((res.body as { error: string }).error).toBe('tap-liquidity-management-unavailable');
+  });
+
+  it('returns signed close params when available', async () => {
+    const svc = new MockPaymentService();
+    (svc as unknown as Record<string, unknown>).createCloseTapParams = async () => ({
+      reservoirSignature: '0x' + 'cd'.repeat(65),
+    });
+    const s = new SqliteMessageStore(':memory:');
+    await s.init();
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const ss = new RuntimeSettingsStore(db, runtimeSettingsFromConfig(serverConfig));
+    const srv = createMailServer(serverConfig, s, svc, ss);
+    await new Promise<void>(r => srv.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    try {
+      const res = await rawJsonRequest(`${url}/tap/close-params`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          user: recipientAddress,
+          myBalance: '4000',
+          reservoirBalance: '6000',
+          nonce: '2',
+          mySignature: '0x' + '11'.repeat(65),
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = res.body as { ok: boolean; reservoirSignature: string };
+      expect(body.ok).toBe(true);
+      expect(body.reservoirSignature).toBe('0x' + 'cd'.repeat(65));
+    } finally {
+      await new Promise<void>((r, j) => srv.close(e => e ? j(e) : r()));
+    }
+  });
+});
+
 describe('POST /tap/sync-state', () => {
   it('returns 503 when syncTapState is not implemented', async () => {
     const authHeader = buildAuthHeader({

@@ -61,6 +61,23 @@ export interface IPaymentService {
     borrowNonce: string;
     mySignature: string;
   }): Promise<{ borrowFee: string; reservoirSignature: string }>;
+  createWithdrawFundsParams?(args: {
+    user: string;
+    token: string | null;
+    amount: string;
+    myBalance: string;
+    reservoirBalance: string;
+    nonce: string;
+    mySignature: string;
+  }): Promise<{ reservoirSignature: string }>;
+  createCloseTapParams?(args: {
+    user: string;
+    token: string | null;
+    myBalance: string;
+    reservoirBalance: string;
+    nonce: string;
+    mySignature: string;
+  }): Promise<{ reservoirSignature: string }>;
   getTrackedTapState?(counterparty: string): Promise<{
     contractId: string;
     pipeKey: {
@@ -76,6 +93,11 @@ export interface IPaymentService {
     pendingCounterpartyBalance?: string;
     nonce: string;
   } | null>;
+  getTapLifecycleState?(counterparty: string): Promise<{
+    status: 'never-opened' | 'active' | 'closing' | 'closed';
+    nextTapNonce: string;
+    nextBorrowNonce: string;
+  }>;
   recordCompletedIncomingPayment?(args: { paymentProof: string; secret: string }): Promise<void>;
   cancelMessage?(args: {
     paymentProof: string;
@@ -992,6 +1014,113 @@ export function createMailServer(
     }
   }
 
+  async function handleTapWithdrawParams(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (typeof paymentService.createWithdrawFundsParams !== 'function') {
+      return json(res, 503, { error: 'tap-liquidity-management-unavailable' });
+    }
+
+    let body: string;
+    try {
+      body = await readBody(req, 4096);
+    } catch {
+      return json(res, 413, { error: 'body-too-large' });
+    }
+
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+      return json(res, 400, { error: 'invalid-json' });
+    }
+
+    const user = typeof data['user'] === 'string' ? data['user'] : '';
+    const tokenRaw = data['token'];
+    const token = typeof tokenRaw === 'string' ? tokenRaw.trim() : (tokenRaw == null ? null : '__invalid__');
+    const amount = String(data['amount'] ?? '');
+    const myBalance = String(data['myBalance'] ?? '');
+    const reservoirBalance = String(data['reservoirBalance'] ?? '');
+    const nonce = String(data['nonce'] ?? '');
+    const mySignature = typeof data['mySignature'] === 'string' ? data['mySignature'] : '';
+    if (token === '__invalid__' || !user || !amount || !myBalance || !reservoirBalance || !nonce || !mySignature) {
+      return json(res, 400, { error: 'invalid-params', message: 'missing required withdraw params' });
+    }
+
+    try {
+      const signed = await paymentService.createWithdrawFundsParams({
+        user,
+        token: token || null,
+        amount,
+        myBalance,
+        reservoirBalance,
+        nonce,
+        mySignature,
+      });
+      return json(res, 200, {
+        ok: true,
+        amount,
+        myBalance,
+        reservoirBalance,
+        nonce,
+        reservoirSignature: signed.reservoirSignature,
+      });
+    } catch (err) {
+      if (respondTypedServiceError(res, err)) return;
+      throw err;
+    }
+  }
+
+  async function handleTapCloseParams(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (typeof paymentService.createCloseTapParams !== 'function') {
+      return json(res, 503, { error: 'tap-liquidity-management-unavailable' });
+    }
+
+    let body: string;
+    try {
+      body = await readBody(req, 4096);
+    } catch {
+      return json(res, 413, { error: 'body-too-large' });
+    }
+
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+      return json(res, 400, { error: 'invalid-json' });
+    }
+
+    const user = typeof data['user'] === 'string' ? data['user'] : '';
+    const tokenRaw = data['token'];
+    const token = typeof tokenRaw === 'string' ? tokenRaw.trim() : (tokenRaw == null ? null : '__invalid__');
+    const myBalance = String(data['myBalance'] ?? '');
+    const reservoirBalance = String(data['reservoirBalance'] ?? '');
+    const nonce = String(data['nonce'] ?? '');
+    const mySignature = typeof data['mySignature'] === 'string' ? data['mySignature'] : '';
+    if (token === '__invalid__' || !user || !myBalance || !reservoirBalance || !nonce || !mySignature) {
+      return json(res, 400, { error: 'invalid-params', message: 'missing required close params' });
+    }
+
+    try {
+      const signed = await paymentService.createCloseTapParams({
+        user,
+        token: token || null,
+        myBalance,
+        reservoirBalance,
+        nonce,
+        mySignature,
+      });
+      return json(res, 200, {
+        ok: true,
+        myBalance,
+        reservoirBalance,
+        nonce,
+        reservoirSignature: signed.reservoirSignature,
+      });
+    } catch (err) {
+      if (respondTypedServiceError(res, err)) return;
+      throw err;
+    }
+  }
+
   async function handleTapState(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const auth = await requireAuth(req, res, { action: 'get-inbox' });
     if (!auth) return;
@@ -999,9 +1128,17 @@ export function createMailServer(
     const tap = typeof paymentService.getTrackedTapState === 'function'
       ? await paymentService.getTrackedTapState(auth.payload.address)
       : null;
+    const lifecycle = typeof paymentService.getTapLifecycleState === 'function'
+      ? await paymentService.getTapLifecycleState(auth.payload.address)
+      : {
+          status: tap ? 'active' : 'never-opened',
+          nextTapNonce: tap?.nonce ?? '0',
+          nextBorrowNonce: tap ? (BigInt(tap.nonce) + 1n).toString() : '1',
+        };
 
     return json(res, 200, {
       ok: true,
+      lifecycle,
       tap: tap == null
         ? null
         : {
@@ -1169,6 +1306,14 @@ export function createMailServer(
 
     if (method === 'POST' && path === '/tap/borrow-more-params') {
       return handleTapBorrowMoreParams(req, res);
+    }
+
+    if (method === 'POST' && path === '/tap/withdraw-params') {
+      return handleTapWithdrawParams(req, res);
+    }
+
+    if (method === 'POST' && path === '/tap/close-params') {
+      return handleTapCloseParams(req, res);
     }
 
     if (method === 'POST' && path === '/tap/sync-state') {
