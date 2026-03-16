@@ -46,7 +46,7 @@ function usage() {
 Human commands:
   mailslot open [--server <url>]
   mailslot inbox [--server <url>] [--claimed]
-  mailslot compose [--server <url>] [--to <address>] [--subject <subject>]
+  mailslot compose [--server <url>] [--to <address or name.btc>] [--subject <subject>]
   mailslot read <message-id> [--server <url>]
   mailslot reply <message-id> [--server <url>]
   mailslot status [--server <url>]
@@ -56,7 +56,7 @@ Agent/raw commands:
   mailslot open --json
   mailslot inbox --json
   mailslot read <message-id> --json
-  mailslot compose --to <address> --subject <subject> --body <text> --json
+  mailslot compose --to <address or name.btc> --subject <subject> --body <text> --json
 
 Auth (in order of precedence):
   1. export MAILSLOT_PRIVATE_KEY=<64-hex-or-66-char-stacks-key>
@@ -236,8 +236,9 @@ async function printSendSignaturePreview(ctx, to, subject, body) {
   const nextNonce = tap.pipeState.nonce + 1n;
   const token = status.supportedToken ?? 'token';
 
+  const recipientDisplay = await formatAddress(to);
   console.log('\nAbout to request a payment signature for this message:');
-  printKv('Recipient', to);
+  printKv('Recipient', recipientDisplay);
   printKv('Subject', subject || '(no subject)');
   printKv('Body length', `${body.length} chars`);
   printKv('Message price', formatAmount(price.toString(), token));
@@ -302,6 +303,68 @@ function getReceiveCapacitySummary(status, tap) {
   };
 }
 
+// ─── BNS v2 name resolution ─────────────────────────────────────────────────
+
+/** Cache of BNS name → STX address resolutions (forward). */
+const bnsForwardCache = new Map();
+/** Cache of STX address → BNS name (reverse). */
+const bnsReverseCache = new Map();
+
+/**
+ * Resolve a BNS name (e.g. "brice.btc") to its owner's STX address.
+ * Returns null if the name doesn't exist or is expired.
+ */
+async function resolveBnsName(name) {
+  if (bnsForwardCache.has(name)) return bnsForwardCache.get(name);
+  try {
+    const res = await fetch(`https://api.bnsv2.com/names/${encodeURIComponent(name)}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json.data?.owner || !json.data?.is_valid) return null;
+    const address = json.data.owner;
+    bnsForwardCache.set(name, address);
+    bnsReverseCache.set(address, name);
+    return address;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reverse-lookup a STX address to its primary BNS name.
+ * Returns null if no name is found.
+ */
+async function reverseLookupBns(address) {
+  if (bnsReverseCache.has(address)) return bnsReverseCache.get(address);
+  try {
+    const res = await fetch(`https://api.hiro.so/v1/addresses/stacks/${encodeURIComponent(address)}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    const name = json.names?.[0] ?? null;
+    if (name) bnsReverseCache.set(address, name);
+    return name;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * If input contains a '.', treat it as a BNS name and resolve it.
+ * Otherwise return the input as-is (assumed to be a STX address).
+ */
+async function resolveRecipient(input) {
+  if (!input.includes('.')) return input;
+  const address = await resolveBnsName(input);
+  if (!address) throw new Error(`Could not resolve BNS name "${input}" — name not found or expired`);
+  return address;
+}
+
+/** Format an address, showing its BNS name if known/available. */
+async function formatAddress(address) {
+  const name = await reverseLookupBns(address);
+  return name ? `${name} (${address})` : address;
+}
+
 function clearScreen() {
   process.stdout.write('\x1Bc');
 }
@@ -351,8 +414,17 @@ async function promptBody(initial = '') {
 
 async function composeFlow(ctx, defaults = {}) {
   const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
-  const to = interactive ? await prompt('To', defaults.to ?? '') : (defaults.to ?? '').trim();
-  if (!to) throw new Error('Recipient address is required');
+  const toInput = interactive ? await prompt('To (address or .btc name)', defaults.to ?? '') : (defaults.to ?? '').trim();
+  if (!toInput) throw new Error('Recipient address is required');
+
+  // Resolve BNS name if input contains a dot
+  let to = toInput;
+  if (toInput.includes('.')) {
+    if (interactive) console.log(`Resolving ${toInput}…`);
+    to = await resolveRecipient(toInput);
+    if (interactive) console.log(`Resolved to ${to}`);
+  }
+
   const subject = interactive ? await prompt('Subject', defaults.subject ?? '') : (defaults.subject ?? '').trim();
   const body = interactive ? await promptBody(defaults.body ?? '') : String(defaults.body ?? '').trim();
   if (!body) throw new Error('Message body is required');
@@ -369,6 +441,19 @@ async function composeFlow(ctx, defaults = {}) {
     serverUrl: ctx.serverUrl,
   });
   return { to, subject, body, result };
+}
+
+/** Batch-resolve BNS names for all sender addresses in a message list. */
+async function prefetchBnsNames(messages) {
+  const addresses = [...new Set(messages.map(m => m.from).filter(Boolean))];
+  await Promise.allSettled(addresses.map(addr => reverseLookupBns(addr)));
+}
+
+/** Get a display label for an address: BNS name if cached, otherwise truncated address. */
+function senderLabel(address, maxLen) {
+  const name = bnsReverseCache.get(address);
+  if (name) return truncate(name, maxLen);
+  return truncate(address, maxLen);
 }
 
 function renderInboxScreen(ctx, messages, selected, includeClaimed) {
@@ -397,7 +482,7 @@ function renderInboxScreen(ctx, messages, selected, includeClaimed) {
     messages.forEach((message, index) => {
       const marker = index === selected ? '>' : ' ';
       const status = message.claimed ? 'opened ' : 'new    ';
-      const from = truncate(message.from, 18);
+      const from = senderLabel(message.from, 18);
       console.log(
         `${marker} [${status}] ${String(index + 1).padStart(2, ' ')}  ${from}  ${truncate(message.id, 10)}  ${formatTimestamp(message.sentAt)}`
       );
@@ -474,7 +559,8 @@ async function selectInboxMessage(ctx, messages, includeClaimed) {
 
 async function renderMessageView(ctx, inboxEntry, message) {
   clearScreen();
-  console.log(`From:    ${message.from}`);
+  const fromDisplay = await formatAddress(message.from);
+  console.log(`From:    ${fromDisplay}`);
   console.log(`Sent:    ${formatTimestamp(message.sentAt)}`);
   console.log(`Amount:  ${formatAmount(message.amount, ctx.status.supportedToken ?? 'token')}`);
   console.log(`Subject: ${message.subject || '(no subject)'}`);
@@ -545,7 +631,8 @@ async function readOne(ctx, messageId, asJson = false) {
     console.log(JSON.stringify(message, null, 2));
     return message;
   }
-  console.log(`From:    ${message.from}`);
+  const fromDisplay = await formatAddress(message.from);
+  console.log(`From:    ${fromDisplay}`);
   console.log(`Sent:    ${formatTimestamp(message.sentAt)}`);
   console.log(`Amount:  ${formatAmount(message.amount, ctx.status.supportedToken ?? 'token')}`);
   console.log(`Subject: ${message.subject || '(no subject)'}`);
@@ -638,6 +725,7 @@ async function refreshCapacity(ctx, options) {
 async function runInbox(ctx, options) {
   let includeClaimed = Boolean(options.claimed);
   const messages = await getInbox(ctx.privateKey, ctx.serverUrl, includeClaimed);
+  await prefetchBnsNames(messages);
 
   if (options.json || !process.stdin.isTTY || !process.stdout.isTTY) {
     console.log(JSON.stringify({ address: ctx.address, messages }, null, 2));

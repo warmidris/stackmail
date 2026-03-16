@@ -518,6 +518,56 @@ async function ensureSupportedTokenAssetNameLoaded(): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// BNS v2 name resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+const bnsForwardCache = new Map<string, string>();
+const bnsReverseCache = new Map<string, string>();
+
+/**
+ * Resolve a BNS name (e.g. "brice.btc") to its owner's STX address.
+ * Returns null if the name doesn't exist or is expired.
+ */
+async function resolveBnsName(name: string): Promise<string | null> {
+  if (bnsForwardCache.has(name)) return bnsForwardCache.get(name)!;
+  try {
+    const res = await fetch(`https://api.bnsv2.com/names/${encodeURIComponent(name)}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json.data?.owner || !json.data?.is_valid) return null;
+    const address: string = json.data.owner;
+    bnsForwardCache.set(name, address);
+    bnsReverseCache.set(address, name);
+    return address;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reverse-lookup a STX address to its primary BNS name.
+ * Returns null if no name is found.
+ */
+async function reverseLookupBns(address: string): Promise<string | null> {
+  if (bnsReverseCache.has(address)) return bnsReverseCache.get(address)!;
+  try {
+    const res = await fetch(`https://api.hiro.so/v1/addresses/stacks/${encodeURIComponent(address)}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    const name: string | undefined = json.names?.[0];
+    if (name) bnsReverseCache.set(address, name);
+    return name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Returns true if the input looks like a BNS name (contains a dot). */
+function isBnsName(input: string): boolean {
+  return input.includes('.');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Canonical pipe key ordering (using @stacks/transactions serializeCV)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2063,9 +2113,11 @@ async function replyToMessage(messageId: string): Promise<void> {
   if (!message?.from) throw new Error('Reply target not found');
   const opened = openedInboxMessages[messageId];
   const subject = opened?.subject?.trim() ? `Re: ${opened.subject}` : '';
-  setComposeRecipient(message.from, subject);
+  // Use cached BNS name if available so user sees a friendly label
+  const bnsName = bnsReverseCache.get(message.from);
+  setComposeRecipient(bnsName ?? message.from, subject);
   showTab('compose');
-  await fetchRecipientInfo(message.from);
+  await fetchRecipientInfo(bnsName ?? message.from);
 }
 
 interface PreviewMessageResponse {
@@ -2200,7 +2252,7 @@ function renderInboxMessages(messages: InboxMessage[]): void {
     el.innerHTML = `
       <div class="msg-header">
         <div>
-          <div class="msg-from">From: ${escHtml(msg.from || '—')}</div>
+          <div class="msg-from" data-address="${escHtml(msg.from || '')}">From: ${escHtml(bnsReverseCache.get(msg.from) ?? (msg.from || '—'))}</div>
           <div style="margin-top:4px;font-size:12px;color:var(--muted)">${time}</div>
         </div>
         <div class="msg-meta">
@@ -2226,6 +2278,19 @@ function renderInboxMessages(messages: InboxMessage[]): void {
         </div>` : ''}`;
 
     listEl.appendChild(el);
+  }
+
+  // Resolve BNS names in the background and update displayed sender labels
+  const unresolvedAddrs = [...new Set(messages.map(m => m.from).filter(a => a && !bnsReverseCache.has(a)))];
+  if (unresolvedAddrs.length) {
+    Promise.allSettled(unresolvedAddrs.map(addr => reverseLookupBns(addr))).then(() => {
+      document.querySelectorAll<HTMLElement>('.msg-from[data-address]').forEach(el => {
+        const addr = el.dataset.address;
+        if (addr && bnsReverseCache.has(addr)) {
+          el.textContent = `From: ${bnsReverseCache.get(addr)!}`;
+        }
+      });
+    });
   }
 }
 
@@ -2313,6 +2378,8 @@ interface RecipientInfo {
 }
 
 let recipientInfo: RecipientInfo | null = null;
+/** When a BNS name is resolved, stores the resolved STX address. */
+let resolvedToAddress: string | null = null;
 
 function getPaymentUnitLabel(): string {
   return getRuntimeSupportedTokenAssetName() ?? 'microstx';
@@ -2367,23 +2434,41 @@ async function fetchRecipientPaymentInfo(addr: string): Promise<RecipientInfo | 
   };
 }
 
-async function fetchRecipientInfo(toAddr: string): Promise<void> {
+async function fetchRecipientInfo(toInput: string): Promise<void> {
   const el = document.getElementById('recipient-status') as HTMLElement;
   el.innerHTML = '<span class="spinner"></span> Looking up recipient…';
 
   const resetErr = (msg: string) => {
     el.innerHTML = `<span style="color:var(--red)">✗ ${escHtml(msg)}</span>`;
     recipientInfo = null;
+    resolvedToAddress = null;
     (document.getElementById('send-btn') as HTMLButtonElement).disabled = true;
     (document.getElementById('payment-panel') as HTMLElement).style.display = 'none';
   };
 
   try {
+    // Resolve BNS name to STX address if input contains a dot
+    let toAddr = toInput;
+    if (isBnsName(toInput)) {
+      el.innerHTML = `<span class="spinner"></span> Resolving ${escHtml(toInput)}…`;
+      const resolved = await resolveBnsName(toInput);
+      if (!resolved) {
+        resetErr(`Could not resolve "${toInput}" — name not found or expired.`);
+        return;
+      }
+      toAddr = resolved;
+      resolvedToAddress = resolved;
+      el.innerHTML = `<span class="spinner"></span> Resolved to ${escHtml(resolved)}, looking up recipient…`;
+    } else {
+      resolvedToAddress = null;
+    }
+
     await ensureSupportedTokenLoaded();
     const serverPaymentInfo = await fetchRecipientPaymentInfo(toAddr);
     if (serverPaymentInfo) {
       recipientInfo = serverPaymentInfo;
-      el.innerHTML  = `<span style="color:var(--green)">✓ Recipient is registered with this Mailslot server</span>`;
+      const bnsNote = resolvedToAddress ? ` (${escHtml(toInput)} → ${escHtml(resolvedToAddress)})` : '';
+      el.innerHTML  = `<span style="color:var(--green)">✓ Recipient is registered with this Mailslot server${bnsNote}</span>`;
     } else {
       const recipientPublicKey = await lookupRecipientPubkey(toAddr);
       if (!recipientPublicKey) {
@@ -2394,7 +2479,8 @@ async function fetchRecipientInfo(toAddr: string): Promise<void> {
       const price      = (serverStatus.messagePriceSats as string | number | undefined) ?? '1000';
       const serverAddr = (serverStatus.serverAddress as string | undefined) ?? '';
       recipientInfo = { recipientPublicKey, serverAddress: serverAddr, amount: price };
-      el.innerHTML  = `<span style="color:var(--green)">✓ Recipient public key recovered from chain history</span>`;
+      const bnsNote = resolvedToAddress ? ` (${escHtml(toInput)} → ${escHtml(resolvedToAddress)})` : '';
+      el.innerHTML  = `<span style="color:var(--green)">✓ Recipient public key recovered from chain history${bnsNote}</span>`;
     }
 
     (document.getElementById('payment-panel') as HTMLElement).style.display = '';
@@ -2419,7 +2505,8 @@ async function fetchRecipientInfo(toAddr: string): Promise<void> {
 }
 
 async function sendMessage(): Promise<void> {
-  const toAddr   = (document.getElementById('to-input') as HTMLInputElement).value.trim();
+  const toInput  = (document.getElementById('to-input') as HTMLInputElement).value.trim();
+  const toAddr   = resolvedToAddress ?? toInput; // Use resolved STX address if BNS name was entered
   const subject  = (document.getElementById('subject-input') as HTMLInputElement).value.trim();
   const body     = (document.getElementById('body-input') as HTMLTextAreaElement).value.trim();
   const statusEl = document.getElementById('send-status') as HTMLElement;
@@ -3109,17 +3196,20 @@ bindEvent('copy-status-addr-btn', 'click', async () => {
 });
 bindEvent('refresh-status-btn', 'click', refreshStatusPanel);
 
-// Auto-fetch recipient info when a valid address is typed
+// Auto-fetch recipient info when a valid address or BNS name is typed
 let toDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 bindEvent('to-input', 'input', (e) => {
   const val = (e.target as HTMLInputElement).value.trim();
   recipientInfo = null;
+  resolvedToAddress = null;
   (document.getElementById('send-btn') as HTMLButtonElement).disabled = true;
   (document.getElementById('payment-panel') as HTMLElement).style.display = 'none';
   (document.getElementById('recipient-status') as HTMLElement).textContent = '';
   if (toDebounceTimer) clearTimeout(toDebounceTimer);
-  if (val.startsWith('S') && val.length >= 30) {
-    toDebounceTimer = setTimeout(() => fetchRecipientInfo(val), 500);
+  const isStxAddress = val.startsWith('S') && val.length >= 30;
+  const isBns = isBnsName(val) && val.length >= 3;
+  if (isStxAddress || isBns) {
+    toDebounceTimer = setTimeout(() => fetchRecipientInfo(val), isBns ? 800 : 500);
   }
 });
 
