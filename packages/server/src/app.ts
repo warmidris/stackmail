@@ -98,6 +98,13 @@ export interface IPaymentService {
     nextTapNonce: string;
     nextBorrowNonce: string;
   }>;
+  getTapRebalanceRequest?(counterparty: string): Promise<{
+    token: string | null;
+    amount: string;
+    myBalance: string;
+    reservoirBalance: string;
+    nonce: string;
+  } | null>;
   recordCompletedIncomingPayment?(args: { paymentProof: string; secret: string }): Promise<void>;
   cancelMessage?(args: {
     paymentProof: string;
@@ -119,6 +126,11 @@ export interface IPaymentService {
     serverSignature?: string | null;
   }): Promise<void>;
   submitDisputeForCounterparty?(counterparty: string): Promise<{
+    txid: string;
+    nonce: string;
+    pipeId: string;
+  }>;
+  submitReturnLiquidityToReservoir?(counterparty: string): Promise<{
     txid: string;
     nonce: string;
     pipeId: string;
@@ -363,6 +375,7 @@ export function createMailServer(
     if (parsed['deferredMessageTtlMs'] != null) patch.deferredMessageTtlMs = Number(parsed['deferredMessageTtlMs']);
     if (parsed['maxBorrowPerTap'] != null) patch.maxBorrowPerTap = String(parsed['maxBorrowPerTap']);
     if (parsed['receiveCapacityMultiplier'] != null) patch.receiveCapacityMultiplier = Number(parsed['receiveCapacityMultiplier']);
+    if (parsed['rebalanceThresholdPct'] != null) patch.rebalanceThresholdPct = Number(parsed['rebalanceThresholdPct']);
     if (parsed['refreshCapacityCooldownMs'] != null) patch.refreshCapacityCooldownMs = Number(parsed['refreshCapacityCooldownMs']);
 
     try {
@@ -1069,6 +1082,71 @@ export function createMailServer(
     }
   }
 
+  async function handleTapRebalance(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (
+      typeof paymentService.createWithdrawFundsParams !== 'function' ||
+      typeof paymentService.submitReturnLiquidityToReservoir !== 'function'
+    ) {
+      return json(res, 503, { error: 'tap-liquidity-management-unavailable' });
+    }
+    const auth = await requireAuth(req, res, { action: 'get-inbox' });
+    if (!auth) return;
+
+    let body: string;
+    try {
+      body = await readBody(req, 4096);
+    } catch {
+      return json(res, 413, { error: 'body-too-large' });
+    }
+
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+      return json(res, 400, { error: 'invalid-json' });
+    }
+
+    const user = typeof data['user'] === 'string' ? data['user'] : '';
+    if (!user || user !== auth.payload.address) {
+      return json(res, 403, { error: 'auth-address-mismatch', message: 'rebalance address must match the authenticated wallet' });
+    }
+    const tokenRaw = data['token'];
+    const token = typeof tokenRaw === 'string' ? tokenRaw.trim() : (tokenRaw == null ? null : '__invalid__');
+    const amount = String(data['amount'] ?? '');
+    const myBalance = String(data['myBalance'] ?? '');
+    const reservoirBalance = String(data['reservoirBalance'] ?? '');
+    const nonce = String(data['nonce'] ?? '');
+    const mySignature = typeof data['mySignature'] === 'string' ? data['mySignature'] : '';
+    if (token === '__invalid__' || !amount || !myBalance || !reservoirBalance || !nonce || !mySignature) {
+      return json(res, 400, { error: 'invalid-params', message: 'missing required rebalance params' });
+    }
+
+    try {
+      const signed = await paymentService.createWithdrawFundsParams({
+        user,
+        token: token || null,
+        amount,
+        myBalance,
+        reservoirBalance,
+        nonce,
+        mySignature,
+      });
+      const submitted = await paymentService.submitReturnLiquidityToReservoir(user);
+      return json(res, 200, {
+        ok: true,
+        amount,
+        myBalance,
+        reservoirBalance,
+        nonce,
+        reservoirSignature: signed.reservoirSignature,
+        txid: submitted.txid,
+      });
+    } catch (err) {
+      if (respondTypedServiceError(res, err)) return;
+      throw err;
+    }
+  }
+
   async function handleTapCloseParams(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (typeof paymentService.createCloseTapParams !== 'function') {
       return json(res, 503, { error: 'tap-liquidity-management-unavailable' });
@@ -1135,10 +1213,14 @@ export function createMailServer(
           nextTapNonce: tap?.nonce ?? '0',
           nextBorrowNonce: tap ? (BigInt(tap.nonce) + 1n).toString() : '1',
         };
+    const rebalance = typeof paymentService.getTapRebalanceRequest === 'function'
+      ? await paymentService.getTapRebalanceRequest(auth.payload.address)
+      : null;
 
     return json(res, 200, {
       ok: true,
       lifecycle,
+      rebalance,
       tap: tap == null
         ? null
         : {
@@ -1310,6 +1392,10 @@ export function createMailServer(
 
     if (method === 'POST' && path === '/tap/withdraw-params') {
       return handleTapWithdrawParams(req, res);
+    }
+
+    if (method === 'POST' && path === '/tap/rebalance') {
+      return handleTapRebalance(req, res);
     }
 
     if (method === 'POST' && path === '/tap/close-params') {

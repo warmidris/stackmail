@@ -150,6 +150,8 @@ export interface Config {
   maxBorrowPerTap: string;
   /** Multiplier applied to messagePriceSats to derive the receive-capacity refresh target (default 20) */
   receiveCapacityMultiplier: number;
+  /** Percent of the receive-capacity target at which the server starts requesting cleanup withdrawals */
+  rebalanceThresholdPct: number;
   /** Minimum delay between receive-capacity refreshes for the same borrower */
   refreshCapacityCooldownMs: number;
   inboxSessionTtlMs: number;
@@ -176,6 +178,7 @@ export interface RuntimeSettings {
   deferredMessageTtlMs: number;
   maxBorrowPerTap: string;
   receiveCapacityMultiplier: number;
+  rebalanceThresholdPct: number;
   refreshCapacityCooldownMs: number;
 }
 
@@ -191,6 +194,7 @@ export function runtimeSettingsFromConfig(config: Pick<
   | 'deferredMessageTtlMs'
   | 'maxBorrowPerTap'
   | 'receiveCapacityMultiplier'
+  | 'rebalanceThresholdPct'
   | 'refreshCapacityCooldownMs'
 >): RuntimeSettings {
   return {
@@ -204,6 +208,7 @@ export function runtimeSettingsFromConfig(config: Pick<
     deferredMessageTtlMs: config.deferredMessageTtlMs,
     maxBorrowPerTap: config.maxBorrowPerTap,
     receiveCapacityMultiplier: config.receiveCapacityMultiplier,
+    rebalanceThresholdPct: config.rebalanceThresholdPct,
     refreshCapacityCooldownMs: config.refreshCapacityCooldownMs,
   };
 }
@@ -236,6 +241,7 @@ export function loadConfig(): Config {
     deferredMessageTtlMs: parseInt(process.env.MAILSLOT_DEFERRED_MESSAGE_TTL_MS ?? '86400000', 10),
     maxBorrowPerTap: process.env.MAILSLOT_MAX_BORROW_PER_TAP ?? '5000',
     receiveCapacityMultiplier: parseInt(process.env.MAILSLOT_RECEIVE_CAPACITY_MULTIPLIER ?? '20', 10),
+    rebalanceThresholdPct: parseInt(process.env.MAILSLOT_REBALANCE_THRESHOLD_PCT ?? '150', 10),
     refreshCapacityCooldownMs: parseInt(process.env.MAILSLOT_REFRESH_CAPACITY_COOLDOWN_MS ?? '86400000', 10),
     inboxSessionTtlMs: parseInt(process.env.MAILSLOT_INBOX_SESSION_TTL_MS ?? '300000', 10),
     allowedOrigins: (process.env.MAILSLOT_ALLOWED_ORIGINS ?? '')

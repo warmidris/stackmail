@@ -13,6 +13,7 @@ type RuntimeSettingKey =
   | 'deferredMessageTtlMs'
   | 'maxBorrowPerTap'
   | 'receiveCapacityMultiplier'
+  | 'rebalanceThresholdPct'
   | 'refreshCapacityCooldownMs';
 
 const RUNTIME_SETTING_KEYS: RuntimeSettingKey[] = [
@@ -26,6 +27,7 @@ const RUNTIME_SETTING_KEYS: RuntimeSettingKey[] = [
   'deferredMessageTtlMs',
   'maxBorrowPerTap',
   'receiveCapacityMultiplier',
+  'rebalanceThresholdPct',
   'refreshCapacityCooldownMs',
 ];
 
@@ -75,6 +77,7 @@ export class RuntimeSettingsStore {
       deferredMessageTtlMs: parseInt(raw.deferredMessageTtlMs ?? String(this.defaults.deferredMessageTtlMs), 10),
       maxBorrowPerTap: raw.maxBorrowPerTap ?? this.defaults.maxBorrowPerTap,
       receiveCapacityMultiplier: parseInt(raw.receiveCapacityMultiplier ?? String(this.defaults.receiveCapacityMultiplier), 10),
+      rebalanceThresholdPct: parseInt(raw.rebalanceThresholdPct ?? String(this.defaults.rebalanceThresholdPct), 10),
       refreshCapacityCooldownMs: parseInt(raw.refreshCapacityCooldownMs ?? String(this.defaults.refreshCapacityCooldownMs), 10),
     };
   }
@@ -111,6 +114,10 @@ export function validateRuntimeSettings(input: RuntimeSettings): RuntimeSettings
   const minFeeSats = uintString(String(input.minFeeSats), 'minFeeSats');
   const maxBorrowPerTap = uintString(String(input.maxBorrowPerTap), 'maxBorrowPerTap');
   const receiveCapacityMultiplier = positiveInt(input.receiveCapacityMultiplier, 'receiveCapacityMultiplier');
+  const rebalanceThresholdPct = positiveInt(input.rebalanceThresholdPct, 'rebalanceThresholdPct');
+  if (rebalanceThresholdPct < 100) {
+    throw new Error('rebalanceThresholdPct must be at least 100');
+  }
   if (BigInt(minFeeSats) > BigInt(messagePriceSats)) {
     throw new Error('minFeeSats must be less than or equal to messagePriceSats');
   }
@@ -126,6 +133,7 @@ export function validateRuntimeSettings(input: RuntimeSettings): RuntimeSettings
     deferredMessageTtlMs: positiveInt(input.deferredMessageTtlMs, 'deferredMessageTtlMs'),
     maxBorrowPerTap,
     receiveCapacityMultiplier,
+    rebalanceThresholdPct,
     refreshCapacityCooldownMs: positiveInt(input.refreshCapacityCooldownMs, 'refreshCapacityCooldownMs'),
   };
 }

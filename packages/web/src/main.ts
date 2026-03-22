@@ -215,14 +215,6 @@ function extractSupportedMethods(resp: unknown): string[] {
   );
 }
 
-function extractEncryptedMessage(resp: unknown): EncryptedMail | null {
-  return (
-    (resp as { result?: { encryptedMessage?: EncryptedMail } })?.result?.encryptedMessage
-    ?? (resp as { encryptedMessage?: EncryptedMail })?.encryptedMessage
-    ?? null
-  );
-}
-
 function extractErrorMessage(error: unknown): string {
   if (typeof error === 'string') return error;
   if (error instanceof Error) return error.message;
@@ -243,7 +235,6 @@ function isWalletCancellationError(error: unknown): boolean {
   const message = extractErrorMessage(error).toLowerCase();
   return message.includes('cancelled')
     || message.includes('canceled')
-    || message.includes('rejected')
     || message.includes('user rejected')
     || message.includes('user denied')
     || message.includes('denied by user')
@@ -354,6 +345,7 @@ function extractRuntimeSettings(status: Record<string, unknown>): RuntimeSetting
     deferredMessageTtlMs: Number(value.deferredMessageTtlMs),
     maxBorrowPerTap: String(value.maxBorrowPerTap),
     receiveCapacityMultiplier: value.receiveCapacityMultiplier != null ? Number(value.receiveCapacityMultiplier) : 20,
+    rebalanceThresholdPct: value.rebalanceThresholdPct != null ? Number(value.rebalanceThresholdPct) : 150,
     refreshCapacityCooldownMs: value.refreshCapacityCooldownMs != null ? Number(value.refreshCapacityCooldownMs) : 86400000,
   };
 }
@@ -370,6 +362,7 @@ function populateAdminSettingsForm(settings: RuntimeSettingsPayload | null): voi
   (document.getElementById('admin-deferred-ttl-input') as HTMLInputElement | null)!.value = String(settings.deferredMessageTtlMs);
   (document.getElementById('admin-max-borrow-per-tap-input') as HTMLInputElement | null)!.value = settings.maxBorrowPerTap;
   (document.getElementById('admin-receive-capacity-multiplier-input') as HTMLInputElement | null)!.value = String(settings.receiveCapacityMultiplier);
+  (document.getElementById('admin-rebalance-threshold-pct-input') as HTMLInputElement | null)!.value = String(settings.rebalanceThresholdPct);
   (document.getElementById('admin-refresh-capacity-cooldown-input') as HTMLInputElement | null)!.value = String(settings.refreshCapacityCooldownMs);
 }
 
@@ -757,6 +750,7 @@ interface RuntimeSettingsPayload {
   deferredMessageTtlMs: number;
   maxBorrowPerTap: string;
   receiveCapacityMultiplier: number;
+  rebalanceThresholdPct: number;
   refreshCapacityCooldownMs: number;
 }
 const DECRYPT_KEY_STORAGE_KEY = 'mailslot.inboxDecryptPrivateKey';
@@ -1202,7 +1196,21 @@ async function sip018SignWithWallet(contractId: string, transferCV: ClarityValue
     domainCV,
     chainId,
   );
-  return signed.signature;
+  return normalizeSip018SignatureForClarity(signed.signature);
+}
+
+function normalizeSip018SignatureForClarity(signature: string): string {
+  const raw = signature.replace(/^0x/, '').toLowerCase();
+  if (raw.length !== 130) return signature;
+  const firstByte = parseInt(raw.slice(0, 2), 16);
+  const lastByte = parseInt(raw.slice(128, 130), 16);
+  const isRecoveryId = (value: number): boolean => value === 0 || value === 1 || value === 27 || value === 28;
+
+  // Wallets often return VRS; Clarity contract calls expect RSV.
+  if (isRecoveryId(firstByte) && !isRecoveryId(lastByte)) {
+    return `0x${raw.slice(2)}${raw.slice(0, 2)}`;
+  }
+  return signature;
 }
 
 async function signStructuredMessageWithWallet(
@@ -1295,6 +1303,13 @@ interface TrackedTapResponse {
     nextTapNonce?: string;
     nextBorrowNonce?: string;
   };
+  rebalance?: {
+    token?: string | null;
+    amount?: string;
+    myBalance?: string;
+    reservoirBalance?: string;
+    nonce?: string;
+  } | null;
   tap?: {
     contractId?: string;
     token?: string | null;
@@ -1315,6 +1330,14 @@ interface TapLifecycleState {
   status: 'never-opened' | 'active' | 'closing' | 'closed';
   nextTapNonce: bigint;
   nextBorrowNonce: bigint;
+}
+
+interface TapRebalanceRequest {
+  token: string | null;
+  amount: bigint;
+  myBalance: bigint;
+  reservoirBalance: bigint;
+  nonce: bigint;
 }
 
 interface LiquidityParamsResponse {
@@ -1499,6 +1522,22 @@ async function queryTapLifecycleState(userAddr: string): Promise<TapLifecycleSta
   };
 }
 
+async function queryTapRebalanceRequest(userAddr: string): Promise<TapRebalanceRequest | null> {
+  const data = await queryTapStateEnvelope(userAddr);
+  if (!data?.rebalance) return null;
+  try {
+    return {
+      token: data.rebalance.token ?? null,
+      amount: BigInt(data.rebalance.amount ?? '0'),
+      myBalance: BigInt(data.rebalance.myBalance ?? '0'),
+      reservoirBalance: BigInt(data.rebalance.reservoirBalance ?? '0'),
+      nonce: BigInt(data.rebalance.nonce ?? '0'),
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function queryTrackedTapState(userAddr: string): Promise<TapState | null> {
   const data = await queryTapStateEnvelope(userAddr);
   if (!data) return null;
@@ -1551,8 +1590,8 @@ async function addFundsToTap(): Promise<void> {
     const supportedToken = getRuntimeSupportedToken();
     const tokenAssetName = supportedToken == null ? null : getRuntimeSupportedTokenAssetName();
     const amount = readPositiveAmountInput('add-funds-amount-input', 'Add funds amount');
-    const tap = await queryOnChainTap(walletAddress);
-    if (!tap) throw new Error('No on-chain tap found. Open your mailbox first.');
+    const tap = await resolveTapState(walletAddress);
+    if (!tap) throw new Error('No tap found. Open your mailbox first.');
     const nextMyBalance = tap.userBalance + amount;
     const nextReservoirBalance = tap.reservoirBalance;
     const nextNonce = tap.nonce + 1n;
@@ -2077,6 +2116,98 @@ function readPositiveAmountInput(id: string, label: string): bigint {
   return amount;
 }
 
+async function executeTapRebalance(
+  rebalance: TapRebalanceRequest,
+  statusEl?: HTMLElement | null,
+): Promise<void> {
+  if (!walletAddress) throw new Error('Wallet not connected');
+  const chainId = (serverStatus.chainId as number | undefined) ?? CHAIN_ID;
+  const sfContract = getRuntimeSfContract();
+  const reservoir = getRuntimeReservoirContract();
+
+  if (rebalance.amount <= 0n) return;
+  if (statusEl) {
+    statusEl.innerHTML = `<div class="alert alert-warning">Before sending, Mailslot needs one quick cleanup signature. Your tap is carrying ${escHtml(formatPaymentAmount(rebalance.amount))} of extra receive liquidity, and this signature lets the server return that excess to the reservoir without changing your message price.</div>`;
+  }
+
+  const tap = await resolveTapState(walletAddress);
+  if (!tap) throw new Error('No tap found.');
+  const expectedToken = rebalance.token ?? tap.pipeKey.token ?? null;
+  if (
+    tap.nonce + 1n !== rebalance.nonce ||
+    tap.userBalance !== rebalance.myBalance ||
+    tap.reservoirBalance - rebalance.amount !== rebalance.reservoirBalance
+  ) {
+    throw new Error('Tap changed before rebalance could be signed. Refresh and try again.');
+  }
+
+  const mySignature = await withTimeout(
+    sip018SignWithWallet(
+      sfContract,
+      buildTransferCV({
+        pipeKey: canonicalPipeKey(expectedToken, walletAddress, reservoir),
+        forPrincipal: walletAddress,
+        myBalance: rebalance.myBalance,
+        theirBalance: rebalance.reservoirBalance,
+        nonce: rebalance.nonce,
+        action: 3n,
+        actor: walletAddress,
+        hashedSecret: null,
+        validAfter: null,
+      }),
+      chainId,
+    ),
+    120_000,
+    'Timed out waiting for wallet signature. Open your wallet extension and approve the SIP-018 request.',
+  );
+
+  if (statusEl) {
+    statusEl.innerHTML = '<div class="alert alert-warning">Cleanup signature received. Submitting the tap rebalance…</div>';
+  }
+  const response = await apiFetch('/tap/rebalance', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(await buildInboxRequestHeaders('get-inbox')),
+    },
+    body: JSON.stringify({
+      user: walletAddress,
+      token: expectedToken,
+      amount: rebalance.amount.toString(),
+      myBalance: rebalance.myBalance.toString(),
+      reservoirBalance: rebalance.reservoirBalance.toString(),
+      nonce: rebalance.nonce.toString(),
+      mySignature,
+    }),
+  });
+  captureInboxSession(response);
+  const data = await response.json().catch(() => ({})) as {
+    error?: string;
+    message?: string;
+    reservoirSignature?: string;
+    txid?: string;
+  };
+  if (!response.ok || !data.reservoirSignature || !data.txid) {
+    throw new Error(data.message || data.error || `Tap rebalance failed (${response.status})`);
+  }
+
+  if (statusEl) {
+    statusEl.innerHTML = `<div class="alert alert-warning">Tap cleanup submitted. Waiting for confirmation before sending your message…<br><a href="${escHtml(formatExplorerTxUrl(data.txid, chainId))}" target="_blank" rel="noopener" class="mono" style="color:inherit">${escHtml(data.txid)}</a></div>`;
+  }
+  await waitForStacksTx(data.txid, chainId, 'tap rebalance');
+  await syncTapStateAfterOnChainAction({
+    token: expectedToken,
+    myBalance: rebalance.myBalance,
+    reservoirBalance: rebalance.reservoirBalance,
+    nonce: rebalance.nonce,
+    action: 3n,
+    actor: walletAddress,
+    mySignature,
+    reservoirSignature: data.reservoirSignature,
+  });
+  await refreshCurrentTapState();
+}
+
 async function syncTapStateAfterOnChainAction(args: {
   token: string | null;
   myBalance: bigint;
@@ -2428,18 +2559,6 @@ function parseWalletDecryptedMail(message: string): DecryptedMailPayload {
     throw new Error('Wallet returned an invalid Mailslot payload');
   }
   return parsed as DecryptedMailPayload;
-}
-
-async function encryptMailWithWallet(payload: unknown, recipientPubkeyHex: string): Promise<EncryptedMail> {
-  const provider = getLeatherProvider();
-  if (!provider) throw new Error('Leather provider not available');
-  const resp = await provider.request('stx_encryptMessage', {
-    message: JSON.stringify(payload),
-    publicKey: recipientPubkeyHex,
-  });
-  const encrypted = extractEncryptedMessage(resp);
-  if (!encrypted) throw new Error('Wallet did not return an encrypted payload');
-  return encrypted;
 }
 
 async function decryptMailWithWallet(payload: EncryptedMail): Promise<DecryptedMailPayload> {
@@ -2802,6 +2921,12 @@ async function sendMessage(): Promise<void> {
 
   try {
     await ensureSupportedTokenLoaded();
+    const rebalance = await queryTapRebalanceRequest(walletAddress!);
+    if (rebalance && rebalance.amount > 0n) {
+      await executeTapRebalance(rebalance, statusEl);
+    }
+    await refreshCurrentTapState();
+
     const chainId    = (serverStatus.chainId as number | undefined) ?? CHAIN_ID;
     const sfContract = getRuntimeSfContract();
     const serverAddr = recipientInfo.serverAddress;
@@ -2882,6 +3007,12 @@ async function sendMessage(): Promise<void> {
     pipeState = { myBalance: newMyBalance, serverBalance: newServerBalance, nonce: newNonce };
     updateIdentityUI();
     (document.getElementById('pay-balance') as HTMLElement).textContent = formatMessageCapacity(pipeState.myBalance);
+
+    const postSendRebalance = await queryTapRebalanceRequest(walletAddress!);
+    if (postSendRebalance && postSendRebalance.amount > 0n) {
+      await executeTapRebalance(postSendRebalance, statusEl);
+      await refreshCurrentTapState();
+    }
 
     statusEl.innerHTML = data.deferred
       ? `
@@ -3256,6 +3387,7 @@ async function saveAdminRuntimeSettings(): Promise<void> {
       deferredMessageTtlMs: readInt('admin-deferred-ttl-input', 'Deferred TTL'),
       maxBorrowPerTap: readUintString('admin-max-borrow-per-tap-input', 'Max Borrow / Tap'),
       receiveCapacityMultiplier: readInt('admin-receive-capacity-multiplier-input', 'Receive Capacity Multiplier'),
+      rebalanceThresholdPct: readInt('admin-rebalance-threshold-pct-input', 'Rebalance Threshold %'),
       refreshCapacityCooldownMs: readInt('admin-refresh-capacity-cooldown-input', 'Refresh Capacity Cooldown'),
     };
   } catch (err) {
@@ -3493,6 +3625,14 @@ bindEvent('copy-status-addr-btn', 'click', async () => {
 });
 bindEvent('refresh-status-btn', 'click', refreshStatusPanel);
 
+function handleComposeSendShortcut(event: KeyboardEvent): void {
+  if (event.key !== 'Enter' || (!event.metaKey && !event.ctrlKey) || event.isComposing) return;
+  const sendBtn = document.getElementById('send-btn') as HTMLButtonElement | null;
+  if (!sendBtn || sendBtn.disabled) return;
+  event.preventDefault();
+  sendBtn.click();
+}
+
 // Auto-fetch recipient info when a valid address or BNS name is typed
 let toDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 bindEvent('to-input', 'input', (e) => {
@@ -3509,6 +3649,9 @@ bindEvent('to-input', 'input', (e) => {
     toDebounceTimer = setTimeout(() => fetchRecipientInfo(val), isBns ? 800 : 500);
   }
 });
+bindEvent('to-input', 'keydown', handleComposeSendShortcut);
+bindEvent('subject-input', 'keydown', handleComposeSendShortcut);
+bindEvent('body-input', 'keydown', handleComposeSendShortcut);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap

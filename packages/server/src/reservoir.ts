@@ -83,6 +83,8 @@ interface PendingTapActionRow {
   counterparty_signature: string | null;
   expires_at: number;
   created_at: number;
+  submitted_txid: string | null;
+  submitted_at: number | null;
 }
 
 interface PendingTapActionMeta {
@@ -91,6 +93,16 @@ interface PendingTapActionMeta {
   amount?: string | null;
   serverSignature?: string | null;
   counterpartySignature?: string | null;
+  submittedTxid?: string | null;
+  submittedAt?: number | null;
+}
+
+export interface TapRebalanceRequest {
+  token: string | null;
+  amount: string;
+  myBalance: string;
+  reservoirBalance: string;
+  nonce: string;
 }
 
 interface OnChainPipeState {
@@ -258,6 +270,26 @@ export class ReservoirService {
     this.initTables();
   }
 
+  private stacksApiBaseUrl(): string {
+    return this.chainId === 1 ? 'https://api.hiro.so' : 'https://api.testnet.hiro.so';
+  }
+
+  private txSenderKey(): string {
+    const normalized = this.serverPrivateKey.trim().replace(/^0x/, '');
+    return normalized.length === 64 ? `${normalized}01` : normalized;
+  }
+
+  private async fetchAddressStxBalance(address: string): Promise<string | null> {
+    try {
+      const response = await fetch(`${this.stacksApiBaseUrl()}/extended/v1/address/${address}/balances`);
+      if (!response.ok) return null;
+      const payload = await response.json() as { stx?: { balance?: string } };
+      return payload.stx?.balance ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async getTrackedTapState(counterparty: string): Promise<{
     contractId: string;
     pipeKey: { 'principal-1': string; 'principal-2': string; token: string | null };
@@ -344,6 +376,72 @@ export class ReservoirService {
     const nextTapNonce = row.nonce;
     const nextBorrowNonce = (BigInt(row.nonce) + 1n).toString();
     return { status, nextTapNonce, nextBorrowNonce };
+  }
+
+  async getTapRebalanceRequest(counterparty: string): Promise<TapRebalanceRequest | null> {
+    if (!this.contractId || !this.reservoirContractId) return null;
+    const tracked = await this.getTrackedTapState(counterparty);
+    if (!tracked) return null;
+
+    let current: Awaited<ReturnType<typeof this.getCurrentRebalanceSnapshot>>;
+    try {
+      current = await this.getCurrentRebalanceSnapshot(counterparty, tracked.pipeKey.token ?? null);
+    } catch (error) {
+      if (error instanceof ReservoirError && error.statusCode < 500) {
+        return null;
+      }
+      throw error;
+    }
+    if (current.hasUnmaturedPending) return null;
+
+    const settings = this.settings.get();
+    const targetReceiveLiquidity = BigInt(settings.messagePriceSats) * BigInt(settings.receiveCapacityMultiplier);
+    const rebalanceThreshold = (targetReceiveLiquidity * BigInt(settings.rebalanceThresholdPct)) / 100n;
+    if (current.serverBalance <= rebalanceThreshold) return null;
+
+    const amount = current.serverBalance - targetReceiveLiquidity;
+    if (amount <= 0n) return null;
+
+    return {
+      token: tracked.pipeKey.token ?? null,
+      amount: amount.toString(),
+      myBalance: current.counterpartyBalance.toString(),
+      reservoirBalance: targetReceiveLiquidity.toString(),
+      nonce: (current.nonce + 1n).toString(),
+    };
+  }
+
+  private async getCurrentRebalanceSnapshot(counterparty: string, token: string | null): Promise<{
+    pipeId: string;
+    pipeKey: { 'principal-1': string; 'principal-2': string; token: string | null };
+    serverBalance: bigint;
+    counterpartyBalance: bigint;
+    nonce: bigint;
+    hasUnmaturedPending: boolean;
+  }> {
+    const current = await this.getCurrentOnChainTapSnapshot(counterparty, token);
+    this.assertTapAllowsActivity(current.pipeId);
+    this.assertNoPendingTapAction(current.pipeId);
+    if (current.hasUnmaturedPending) {
+      return current;
+    }
+
+    const latest = this.getLatestPipeState(current.pipeId);
+    if (!latest) return current;
+
+    const pipeKey = JSON.parse(latest.pipe_key_json) as {
+      'principal-1': string;
+      'principal-2': string;
+      token: string | null;
+    };
+    return {
+      pipeId: current.pipeId,
+      pipeKey,
+      serverBalance: BigInt(latest.server_balance),
+      counterpartyBalance: BigInt(latest.counterparty_balance),
+      nonce: BigInt(latest.nonce),
+      hasUnmaturedPending: false,
+    };
   }
 
   private async getCurrentOnChainTapSnapshot(counterparty: string, token: string | null): Promise<{
@@ -437,6 +535,50 @@ export class ReservoirService {
     };
   }
 
+  private async getOrRecoverTrackedTapSnapshot(counterparty: string, token: string | null): Promise<{
+    pipeId: string;
+    pipeKey: { 'principal-1': string; 'principal-2': string; token: string | null };
+    serverBalance: bigint;
+    counterpartyBalance: bigint;
+    nonce: bigint;
+  }> {
+    try {
+      return this.getCurrentTrackedTapSnapshot(counterparty, token);
+    } catch (error) {
+      if (!(error instanceof ReservoirError) || error.reason !== 'no-tap') {
+        throw error;
+      }
+    }
+
+    const current = await this.getCurrentOnChainTapSnapshot(counterparty, token);
+    this.assertTapAllowsActivity(current.pipeId);
+    if (current.hasUnmaturedPending) {
+      throw new ReservoirError(
+        409,
+        'tap has an on-chain pending deposit that has not matured yet',
+        'tap-has-onchain-pending',
+      );
+    }
+
+    this.upsertPipe(
+      current.pipeId,
+      this.contractId,
+      current.pipeKey,
+      current.serverBalance.toString(),
+      current.counterpartyBalance.toString(),
+      current.nonce.toString(),
+      { tapStatus: 'active' },
+    );
+
+    return {
+      pipeId: current.pipeId,
+      pipeKey: current.pipeKey,
+      serverBalance: current.serverBalance,
+      counterpartyBalance: current.counterpartyBalance,
+      nonce: current.nonce,
+    };
+  }
+
   private getLastRefreshAt(borrower: string): number | null {
     const db = this.assertDb();
     const row = db.prepare(`
@@ -474,6 +616,17 @@ export class ReservoirService {
       .get(pipeId) as PendingTapActionRow | null;
   }
 
+  private getUnsubmittedPendingTapActions(action: string): PendingTapActionRow[] {
+    return this.assertDb()
+      .prepare(`
+        SELECT *
+        FROM reservoir_pending_tap_actions
+        WHERE action = ? AND submitted_at IS NULL
+        ORDER BY created_at ASC
+      `)
+      .all(action) as PendingTapActionRow[];
+  }
+
   private clearPendingTapAction(pipeId: string): void {
     this.assertDb()
       .prepare('DELETE FROM reservoir_pending_tap_actions WHERE pipe_id = ?')
@@ -493,9 +646,9 @@ export class ReservoirService {
       INSERT INTO reservoir_pending_tap_actions (
         pipe_id, contract_id, pipe_key_json, server_balance, counterparty_balance,
         nonce, action, actor, amount, server_signature, counterparty_signature,
-        expires_at, created_at
+        expires_at, created_at, submitted_txid, submitted_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch('now') * 1000)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch('now') * 1000, ?, ?)
       ON CONFLICT(pipe_id) DO UPDATE SET
         contract_id = excluded.contract_id,
         pipe_key_json = excluded.pipe_key_json,
@@ -508,7 +661,9 @@ export class ReservoirService {
         server_signature = excluded.server_signature,
         counterparty_signature = excluded.counterparty_signature,
         expires_at = excluded.expires_at,
-        created_at = excluded.created_at
+        created_at = excluded.created_at,
+        submitted_txid = excluded.submitted_txid,
+        submitted_at = excluded.submitted_at
     `).run(
       pipeId,
       contractId,
@@ -522,6 +677,8 @@ export class ReservoirService {
       meta.serverSignature ?? null,
       meta.counterpartySignature ?? null,
       Number.MAX_SAFE_INTEGER,
+      meta.submittedTxid ?? null,
+      meta.submittedAt ?? null,
     );
   }
 
@@ -624,7 +781,9 @@ export class ReservoirService {
         server_signature       TEXT,
         counterparty_signature TEXT,
         expires_at             INTEGER NOT NULL,
-        created_at             INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
+        created_at             INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
+        submitted_txid         TEXT,
+        submitted_at           INTEGER
       );
     `);
 
@@ -643,6 +802,16 @@ export class ReservoirService {
     ensureColumn('last_counterparty_signature', 'TEXT');
     ensureColumn('enforceable_secret', 'TEXT');
     ensureColumn('tap_status', `TEXT NOT NULL DEFAULT 'active'`);
+
+    const pendingTapActionCols = db.prepare(`PRAGMA table_info('reservoir_pending_tap_actions')`).all() as Array<{ name: string }>;
+    const pendingTapActionColSet = new Set(pendingTapActionCols.map(c => c.name));
+    const ensurePendingTapActionColumn = (name: string, typeSql: string): void => {
+      if (!pendingTapActionColSet.has(name)) {
+        db.exec(`ALTER TABLE reservoir_pending_tap_actions ADD COLUMN ${name} ${typeSql};`);
+      }
+    };
+    ensurePendingTapActionColumn('submitted_txid', 'TEXT');
+    ensurePendingTapActionColumn('submitted_at', 'INTEGER');
   }
 
   private assertDb(): DB {
@@ -855,6 +1024,8 @@ export class ReservoirService {
     nonce: string,
     meta: PipeUpdateMeta = {},
   ): void {
+    const insertTapStatus = meta.tapStatus ?? 'active';
+    const updateTapStatus = meta.tapStatus ?? null;
     this.assertDb().prepare(`
       INSERT INTO reservoir_pipes (
         pipe_id, contract_id, pipe_key_json, server_balance, counterparty_balance, nonce,
@@ -895,8 +1066,8 @@ export class ReservoirService {
           ELSE excluded.enforceable_secret
         END,
         tap_status = CASE
-          WHEN excluded.tap_status IS NULL THEN reservoir_pipes.tap_status
-          ELSE excluded.tap_status
+          WHEN ? IS NULL THEN reservoir_pipes.tap_status
+          ELSE ?
         END,
         updated_at = excluded.updated_at
     `).run(
@@ -913,7 +1084,9 @@ export class ReservoirService {
       meta.serverSignature ?? null,
       meta.counterpartySignature ?? null,
       meta.enforceableSecret ?? null,
-      meta.tapStatus ?? null,
+      insertTapStatus,
+      updateTapStatus,
+      updateTapStatus,
     );
   }
 
@@ -1737,9 +1910,7 @@ export class ReservoirService {
       throw new ReservoirError(400, 'amount must be > 0', 'invalid-add-funds-amount');
     }
 
-    const current = await this.getCurrentOnChainTapSnapshot(args.user, token);
-    this.assertTapAllowsActivity(current.pipeId);
-    this.assertNoOptimisticPendingStates(current.pipeId, current.nonce);
+    const current = await this.getCurrentRebalanceSnapshot(args.user, token);
     if (current.hasUnmaturedPending) {
       throw new ReservoirError(
         409,
@@ -1843,7 +2014,7 @@ export class ReservoirService {
       throw new ReservoirError(400, 'borrowAmount must be > 0', 'invalid-borrow-amount');
     }
 
-    const current = this.getCurrentTrackedTapSnapshot(args.borrower, token);
+    const current = await this.getOrRecoverTrackedTapSnapshot(args.borrower, token);
     this.assertTapAllowsActivity(current.pipeId);
     if (borrowNonce !== current.nonce + 1n) {
       throw new ReservoirError(400, `borrowNonce must be ${current.nonce + 1n}`, 'invalid-borrow-nonce');
@@ -1997,23 +2168,21 @@ export class ReservoirService {
       throw new ReservoirError(400, 'amount must be > 0', 'invalid-withdraw-amount');
     }
 
-    const current = await this.getCurrentOnChainTapSnapshot(args.user, token);
-    this.assertTapAllowsActivity(current.pipeId);
-    this.assertNoOptimisticPendingStates(current.pipeId, current.nonce);
+    const current = await this.getCurrentRebalanceSnapshot(args.user, token);
     if (current.hasUnmaturedPending) {
       throw new ReservoirError(409, 'tap has an on-chain pending deposit that has not matured yet', 'tap-has-onchain-pending');
     }
     if (nonce !== current.nonce + 1n) {
       throw new ReservoirError(400, `nonce must be ${current.nonce + 1n}`, 'invalid-withdraw-nonce');
     }
-    if (myBalance !== current.counterpartyBalance - amount) {
-      throw new ReservoirError(400, 'myBalance must equal the current user balance minus the withdrawal amount', 'invalid-my-balance');
+    if (myBalance !== current.counterpartyBalance) {
+      throw new ReservoirError(400, 'myBalance must equal the current user balance', 'invalid-my-balance');
     }
-    if (myBalance < 0n) {
-      throw new ReservoirError(400, 'withdraw amount exceeds the current user balance', 'invalid-withdraw-amount');
+    if (reservoirBalance !== current.serverBalance - amount) {
+      throw new ReservoirError(400, 'reservoirBalance must equal the current reservoir balance minus the withdrawal amount', 'invalid-reservoir-balance');
     }
-    if (reservoirBalance !== current.serverBalance) {
-      throw new ReservoirError(400, 'reservoirBalance must equal the current reservoir balance', 'invalid-reservoir-balance');
+    if (reservoirBalance < 0n) {
+      throw new ReservoirError(400, 'withdraw amount exceeds the current reservoir balance', 'invalid-withdraw-amount');
     }
 
     const userState: TransferState = {
@@ -2069,7 +2238,180 @@ export class ReservoirService {
         counterpartySignature: args.mySignature,
       },
     );
+    this.upsertPendingTapAction(
+      current.pipeId,
+      this.contractId,
+      current.pipeKey,
+      reservoirBalance.toString(),
+      myBalance.toString(),
+      nonce.toString(),
+      {
+        action: '3',
+        actor: args.user,
+        amount: amount.toString(),
+        serverSignature: reservoirSignature,
+        counterpartySignature: args.mySignature,
+      },
+    );
     return { reservoirSignature };
+  }
+
+  async submitReturnLiquidityToReservoir(counterparty: string): Promise<{
+    txid: string;
+    nonce: string;
+    pipeId: string;
+  }> {
+    if (!this.serverPrivateKey) {
+      throw new ReservoirError(503, 'reservoir signing key unavailable', 'reservoir-key-missing');
+    }
+    if (!this.contractId) {
+      throw new ReservoirError(503, 'stackflow contract not configured', 'stackflow-contract-missing');
+    }
+    if (!this.reservoirContractId) {
+      throw new ReservoirError(503, 'reservoir contract not configured', 'reservoir-contract-missing');
+    }
+
+    const principals = canonicalPipePrincipals(this.serverAddress, counterparty);
+    const pipeRow = this.getLatestPipeRowForPrincipals(
+      this.contractId,
+      principals['principal-1'],
+      principals['principal-2'],
+    );
+    if (!pipeRow) {
+      throw new ReservoirError(404, 'tap not found', 'tap-not-found');
+    }
+    const pending = this.getPendingTapAction(pipeRow.pipe_id);
+    if (!pending || pending.action !== '3') {
+      throw new ReservoirError(409, 'no signed rebalance withdrawal is pending for this tap', 'rebalance-not-pending');
+    }
+    if (pending.submitted_at != null && pending.submitted_txid) {
+      return {
+        txid: pending.submitted_txid,
+        nonce: pending.nonce,
+        pipeId: pending.pipe_id,
+      };
+    }
+
+    const pipeKey = JSON.parse(pending.pipe_key_json) as {
+      'principal-1': string;
+      'principal-2': string;
+      token: string | null;
+    };
+    const [reservoirAddress, reservoirName] = this.reservoirContractId.split('.');
+    if (!reservoirAddress || !reservoirName) {
+      throw new ReservoirError(503, 'reservoir contract not configured', 'reservoir-contract-missing');
+    }
+    if (!pending.amount || !pending.counterparty_signature || !pending.server_signature) {
+      throw new ReservoirError(409, 'rebalance action is missing withdrawal signatures', 'rebalance-signatures-missing');
+    }
+
+    console.info('[reservoir] submitting rebalance withdrawal', {
+      counterparty,
+      signerAddress: this.signerAddress,
+      amount: pending.amount,
+      nonce: pending.nonce,
+      userBalance: pending.counterparty_balance,
+      reservoirBalance: pending.server_balance,
+    });
+
+    const tokenArg = pipeKey.token ? someCV(principalCV(pipeKey.token)) : noneCV();
+    const tx = await makeContractCall({
+      network: this.network,
+      senderKey: this.txSenderKey(),
+      contractAddress: reservoirAddress,
+      contractName: reservoirName,
+      functionName: 'return-liquidity-to-reservoir',
+      functionArgs: [
+        principalCV(this.contractId),
+        tokenArg,
+        principalCV(counterparty),
+        uintCV(BigInt(pending.amount)),
+        uintCV(BigInt(pending.counterparty_balance)),
+        uintCV(BigInt(pending.server_balance)),
+        bufferCV(hexToBytes(pending.counterparty_signature)),
+        bufferCV(hexToBytes(pending.server_signature)),
+        uintCV(BigInt(pending.nonce)),
+      ],
+      postConditionMode: PostConditionMode.Allow,
+      validateWithAbi: false,
+    });
+
+    const result = await broadcastTransaction({
+      transaction: tx,
+      network: this.network,
+    });
+
+    if ('reason' in result) {
+      const signerBalance = result.reason === 'NotEnoughFunds'
+        ? await this.fetchAddressStxBalance(this.signerAddress)
+        : null;
+      console.error('[reservoir] rebalance withdrawal broadcast failed', {
+        counterparty,
+        signerAddress: this.signerAddress,
+        signerStxBalance: signerBalance,
+        amount: pending.amount,
+        nonce: pending.nonce,
+        reason: result.reason,
+        error: result.error ?? null,
+      });
+      throw new ReservoirError(
+        502,
+        `rebalance withdrawal broadcast failed: ${result.reason}${result.error ? ` (${result.error})` : ''}${signerBalance != null ? `; signer ${this.signerAddress} has ${signerBalance} microSTX` : ''}`,
+        'rebalance-broadcast-failed',
+      );
+    }
+
+    console.info('[reservoir] rebalance withdrawal broadcast ok', {
+      counterparty,
+      txid: result.txid,
+      nonce: pending.nonce,
+    });
+
+    this.upsertPendingTapAction(
+      pending.pipe_id,
+      pending.contract_id,
+      pipeKey,
+      pending.server_balance,
+      pending.counterparty_balance,
+      pending.nonce,
+      {
+        action: pending.action,
+        actor: pending.actor,
+        amount: pending.amount,
+        serverSignature: pending.server_signature,
+        counterpartySignature: pending.counterparty_signature,
+        submittedTxid: result.txid,
+        submittedAt: Date.now(),
+      },
+    );
+
+    return {
+      txid: result.txid,
+      nonce: pending.nonce,
+      pipeId: pending.pipe_id,
+    };
+  }
+
+  async sweepPendingRebalances(): Promise<Array<{ counterparty: string; txid: string }>> {
+    const pending = this.getUnsubmittedPendingTapActions('3');
+    const submitted: Array<{ counterparty: string; txid: string }> = [];
+    for (const action of pending) {
+      const pipeKey = JSON.parse(action.pipe_key_json) as {
+        'principal-1': string;
+        'principal-2': string;
+        token: string | null;
+      };
+      const counterparty = pipeKey['principal-1'] === this.serverAddress
+        ? pipeKey['principal-2']
+        : pipeKey['principal-1'];
+      try {
+        const result = await this.submitReturnLiquidityToReservoir(counterparty);
+        submitted.push({ counterparty, txid: result.txid });
+      } catch (error) {
+        console.warn('[reservoir] failed to submit pending rebalance:', counterparty, error);
+      }
+    }
+    return submitted;
   }
 
   async createCloseTapParams(args: {
@@ -2334,7 +2676,7 @@ export class ReservoirService {
 
     const tx = await makeContractCall({
       network: this.network,
-      senderKey: this.serverPrivateKey,
+      senderKey: this.txSenderKey(),
       contractAddress,
       contractName,
       functionName: 'dispute-closure-for',
@@ -2422,7 +2764,7 @@ export class ReservoirService {
     const tokenArg = pipeKey.token ? someCV(principalCV(pipeKey.token)) : noneCV();
     const tx = await makeContractCall({
       network: this.network,
-      senderKey: this.serverPrivateKey,
+      senderKey: this.txSenderKey(),
       contractAddress: reservoirAddress,
       contractName: reservoirName,
       functionName: 'force-close-tap',

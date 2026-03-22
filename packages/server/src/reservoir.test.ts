@@ -46,6 +46,7 @@ function makeSettingsStore(db: import('better-sqlite3').Database) {
     deferredMessageTtlMs: 86_400_000,
     maxBorrowPerTap: '100000',
     receiveCapacityMultiplier: 20,
+    rebalanceThresholdPct: 150,
     refreshCapacityCooldownMs: 86_400_000,
   }));
 }
@@ -192,6 +193,60 @@ describe('ReservoirService', () => {
     expect(rows[1]['actor']).toBe(serverAddress);
     expect(rows[1]['hashed_secret']).toBe(outgoingSecret);
     expect(typeof rows[1]['server_signature']).toBe('string');
+  });
+
+  it('records completed incoming payments with an active tap status when no tracked pipe row exists yet', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const serverPriv = privKeyHex();
+    const senderPriv = privKeyHex();
+    const serverAddress = stxAddressFromPrivkey(serverPriv);
+    const senderAddress = stxAddressFromPrivkey(senderPriv);
+    const contractId = `${serverAddress}.stackflow-test`;
+    const service = new ReservoirService({
+      db,
+      settings: makeSettingsStore(db),
+      serverAddress,
+      serverPrivateKey: serverPriv,
+      contractId,
+      chainId: 1,
+    });
+
+    const principals = canonicalPipePrincipals(serverAddress, senderAddress);
+    const proof = Buffer.from(JSON.stringify({
+      contractId,
+      pipeKey: {
+        'principal-1': principals['principal-1'],
+        'principal-2': principals['principal-2'],
+        token: null,
+      },
+      forPrincipal: serverAddress,
+      withPrincipal: senderAddress,
+      myBalance: '1500',
+      theirBalance: '8500',
+      nonce: '3',
+      action: '1',
+      actor: senderAddress,
+      hashedSecret: 'aa'.repeat(32),
+      theirSignature: 'bb'.repeat(65),
+    })).toString('base64url');
+
+    await service.recordCompletedIncomingPayment({
+      paymentProof: proof,
+      secret: 'cc'.repeat(32),
+    });
+
+    const row = db.prepare(`
+      SELECT server_balance, counterparty_balance, nonce, tap_status, enforceable_secret
+      FROM reservoir_pipes
+      WHERE pipe_id = ?
+    `).get(pipeId(contractId, principals['principal-1'], principals['principal-2'])) as Record<string, unknown>;
+
+    expect(row.server_balance).toBe('1500');
+    expect(row.counterparty_balance).toBe('8500');
+    expect(row.nonce).toBe('3');
+    expect(row.tap_status).toBe('active');
+    expect(row.enforceable_secret).toBe('cc'.repeat(32));
   });
 
   it('rejects non-canonical pipe principal order', async () => {
@@ -587,6 +642,185 @@ describe('ReservoirService', () => {
     expect(typeof result.reservoirSignature).toBe('string');
   });
 
+  it('recovers a missing tracked tap from on-chain state before creating refresh params', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const serverPriv = privKeyHex();
+    const borrowerPriv = privKeyHex();
+    const signerAddress = stxAddressFromPrivkey(serverPriv);
+    const borrowerAddress = stxAddressFromPrivkey(borrowerPriv);
+    const reservoirContractId = `${signerAddress}.sm-reservoir`;
+    const contractId = `${signerAddress}.sm-stackflow`;
+    const service = new ReservoirService({
+      db,
+      settings: makeSettingsStore(db),
+      serverAddress: reservoirContractId,
+      signerAddress,
+      reservoirContractId,
+      serverPrivateKey: serverPriv,
+      contractId,
+      chainId: 1,
+    });
+
+    const principals = canonicalPipePrincipals(borrowerAddress, reservoirContractId);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v2/info')) {
+        return {
+          ok: true,
+          json: async () => ({ burn_block_height: 999 }),
+        } as Response;
+      }
+      if (url.includes('/get-borrow-fee')) {
+        return {
+          ok: true,
+          json: async () => ({ okay: true, result: '0x0100000000000000000000000000000000' }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({ okay: true, result: encodeSomePipe({
+          balance1: principals['principal-1'] === reservoirContractId ? 6000n : 14000n,
+          balance2: principals['principal-1'] === reservoirContractId ? 14000n : 6000n,
+          nonce: 8n,
+        }) }),
+      } as Response;
+    }) as unknown as typeof fetch);
+
+    const refreshState: TransferState = {
+      pipeKey: {
+        'principal-1': principals['principal-1'],
+        'principal-2': principals['principal-2'],
+        token: null,
+      },
+      forPrincipal: borrowerAddress,
+      myBalance: '14000',
+      theirBalance: '10000',
+      nonce: '9',
+      action: '2',
+      actor: reservoirContractId,
+      hashedSecret: null,
+      validAfter: null,
+    };
+    const borrowerSig = await sip018Sign(contractId, buildTransferMessage(refreshState), borrowerPriv, 1);
+
+    const result = await service.createBorrowLiquidityParams({
+      borrower: borrowerAddress,
+      token: null,
+      borrowAmount: '4000',
+      myBalance: '14000',
+      reservoirBalance: '10000',
+      borrowNonce: '9',
+      mySignature: borrowerSig,
+    });
+
+    expect(result.borrowFee).toBe('0');
+    expect(typeof result.reservoirSignature).toBe('string');
+
+    const recovered = await service.getTrackedTapState(borrowerAddress);
+    expect(recovered?.serverBalance).toBe('6000');
+    expect(recovered?.counterpartyBalance).toBe('14000');
+    expect(recovered?.nonce).toBe('8');
+  });
+
+  it('creates add-funds params from the latest optimistic tap state', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const serverPriv = privKeyHex();
+    const borrowerPriv = privKeyHex();
+    const signerAddress = stxAddressFromPrivkey(serverPriv);
+    const borrowerAddress = stxAddressFromPrivkey(borrowerPriv);
+    const reservoirContractId = `${signerAddress}.sm-reservoir`;
+    const contractId = `${signerAddress}.sm-stackflow`;
+    const service = new ReservoirService({
+      db,
+      settings: makeSettingsStore(db),
+      serverAddress: reservoirContractId,
+      signerAddress,
+      reservoirContractId,
+      serverPrivateKey: serverPriv,
+      contractId,
+      chainId: 1,
+    });
+
+    const principals = canonicalPipePrincipals(borrowerAddress, reservoirContractId);
+    const currentPipeId = pipeId(contractId, principals['principal-1'], principals['principal-2']);
+    const pipeKey = {
+      'principal-1': principals['principal-1'],
+      'principal-2': principals['principal-2'],
+      token: null,
+    };
+    db.prepare(`
+      INSERT INTO reservoir_pipes (
+        pipe_id, contract_id, pipe_key_json, server_balance, counterparty_balance, nonce, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, unixepoch('now') * 1000)
+    `).run(
+      currentPipeId,
+      contractId,
+      JSON.stringify(pipeKey),
+      '29000',
+      '2500',
+      '19',
+    );
+    db.prepare(`
+      INSERT INTO reservoir_pending_states (
+        pipe_id, nonce, contract_id, pipe_key_json, server_balance, counterparty_balance, action, actor, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch('now') * 1000)
+    `).run(
+      currentPipeId,
+      '21',
+      contractId,
+      JSON.stringify(pipeKey),
+      '31000',
+      '500',
+      '1',
+      borrowerAddress,
+    );
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v2/info')) {
+        return {
+          ok: true,
+          json: async () => ({ burn_block_height: 999 }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({ okay: true, result: encodeSomePipe({
+          balance1: principals['principal-1'] === reservoirContractId ? 29000n : 2500n,
+          balance2: principals['principal-1'] === reservoirContractId ? 2500n : 29000n,
+          nonce: 19n,
+        }) }),
+      } as Response;
+    }) as unknown as typeof fetch);
+
+    const depositState: TransferState = {
+      pipeKey,
+      forPrincipal: borrowerAddress,
+      myBalance: '2000',
+      theirBalance: '31000',
+      nonce: '22',
+      action: '2',
+      actor: borrowerAddress,
+      hashedSecret: null,
+      validAfter: null,
+    };
+    const borrowerSig = await sip018Sign(contractId, buildTransferMessage(depositState), borrowerPriv, 1);
+
+    const result = await service.createAddFundsParams({
+      user: borrowerAddress,
+      token: null,
+      amount: '1500',
+      myBalance: '2000',
+      reservoirBalance: '31000',
+      nonce: '22',
+      mySignature: borrowerSig,
+    });
+
+    expect(typeof result.reservoirSignature).toBe('string');
+  });
+
   it('creates withdraw params from the current on-chain tap and advances the tracked nonce', async () => {
     const { default: Database } = await import('better-sqlite3');
     const db = new Database(':memory:');
@@ -650,8 +884,8 @@ describe('ReservoirService', () => {
         token: null,
       },
       forPrincipal: borrowerAddress,
-      myBalance: '13000',
-      theirBalance: '10000',
+      myBalance: '14000',
+      theirBalance: '9000',
       nonce: '9',
       action: '3',
       actor: borrowerAddress,
@@ -664,8 +898,8 @@ describe('ReservoirService', () => {
       user: borrowerAddress,
       token: null,
       amount: '1000',
-      myBalance: '13000',
-      reservoirBalance: '10000',
+      myBalance: '14000',
+      reservoirBalance: '9000',
       nonce: '9',
       mySignature: borrowerSig,
     });
@@ -674,7 +908,345 @@ describe('ReservoirService', () => {
 
     const latest = await service.getTrackedTapState(borrowerAddress);
     expect(latest?.nonce).toBe('9');
-    expect(latest?.counterpartyBalance).toBe('13000');
+    expect(latest?.counterpartyBalance).toBe('14000');
+    expect(latest?.serverBalance).toBe('9000');
+
+    const pendingAction = db.prepare(`
+      SELECT action, amount, nonce, counterparty_balance, server_balance
+      FROM reservoir_pending_tap_actions
+      WHERE pipe_id = ?
+    `).get(pipeId(contractId, principals['principal-1'], principals['principal-2'])) as Record<string, unknown>;
+    expect(pendingAction.action).toBe('3');
+    expect(pendingAction.amount).toBe('1000');
+    expect(pendingAction.nonce).toBe('9');
+    expect(pendingAction.counterparty_balance).toBe('14000');
+    expect(pendingAction.server_balance).toBe('9000');
+  });
+
+  it('returns a rebalance request when receive liquidity is above the configured target', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const serverPriv = privKeyHex();
+    const borrowerPriv = privKeyHex();
+    const signerAddress = stxAddressFromPrivkey(serverPriv);
+    const borrowerAddress = stxAddressFromPrivkey(borrowerPriv);
+    const reservoirContractId = `${signerAddress}.sm-reservoir`;
+    const contractId = `${signerAddress}.sm-stackflow`;
+    const service = new ReservoirService({
+      db,
+      settings: makeSettingsStore(db),
+      serverAddress: reservoirContractId,
+      signerAddress,
+      reservoirContractId,
+      serverPrivateKey: serverPriv,
+      contractId,
+      chainId: 1,
+    });
+
+    const principals = canonicalPipePrincipals(borrowerAddress, reservoirContractId);
+    db.prepare(`
+      INSERT INTO reservoir_pipes (
+        pipe_id, contract_id, pipe_key_json, server_balance, counterparty_balance, nonce, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, unixepoch('now') * 1000)
+    `).run(
+      pipeId(contractId, principals['principal-1'], principals['principal-2']),
+      contractId,
+      JSON.stringify({
+        'principal-1': principals['principal-1'],
+        'principal-2': principals['principal-2'],
+        token: null,
+      }),
+      '16000',
+      '14000',
+      '8',
+    );
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v2/info')) {
+        return { ok: true, json: async () => ({ burn_block_height: 999 }) } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({ okay: true, result: encodeSomePipe({
+          balance1: principals['principal-1'] === reservoirContractId ? 16000n : 14000n,
+          balance2: principals['principal-1'] === reservoirContractId ? 14000n : 16000n,
+          nonce: 8n,
+        }) }),
+      } as Response;
+    }) as unknown as typeof fetch);
+
+    const rebalance = await service.getTapRebalanceRequest(borrowerAddress);
+    expect(rebalance).toEqual({
+      token: null,
+      amount: '6000',
+      myBalance: '14000',
+      reservoirBalance: '10000',
+      nonce: '9',
+    });
+  });
+
+  it('does not request a rebalance until receive liquidity reaches the configured threshold', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const serverPriv = privKeyHex();
+    const borrowerPriv = privKeyHex();
+    const signerAddress = stxAddressFromPrivkey(serverPriv);
+    const borrowerAddress = stxAddressFromPrivkey(borrowerPriv);
+    const reservoirContractId = `${signerAddress}.sm-reservoir`;
+    const contractId = `${signerAddress}.sm-stackflow`;
+    const service = new ReservoirService({
+      db,
+      settings: makeSettingsStore(db),
+      serverAddress: reservoirContractId,
+      signerAddress,
+      reservoirContractId,
+      serverPrivateKey: serverPriv,
+      contractId,
+      chainId: 1,
+    });
+
+    const principals = canonicalPipePrincipals(borrowerAddress, reservoirContractId);
+    db.prepare(`
+      INSERT INTO reservoir_pipes (
+        pipe_id, contract_id, pipe_key_json, server_balance, counterparty_balance, nonce, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, unixepoch('now') * 1000)
+    `).run(
+      pipeId(contractId, principals['principal-1'], principals['principal-2']),
+      contractId,
+      JSON.stringify({
+        'principal-1': principals['principal-1'],
+        'principal-2': principals['principal-2'],
+        token: null,
+      }),
+      '14000',
+      '14000',
+      '8',
+    );
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v2/info')) {
+        return { ok: true, json: async () => ({ burn_block_height: 999 }) } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({ okay: true, result: encodeSomePipe({
+          balance1: principals['principal-1'] === reservoirContractId ? 14000n : 14000n,
+          balance2: principals['principal-1'] === reservoirContractId ? 14000n : 14000n,
+          nonce: 8n,
+        }) }),
+      } as Response;
+    }) as unknown as typeof fetch);
+
+    const rebalance = await service.getTapRebalanceRequest(borrowerAddress);
+    expect(rebalance).toBeNull();
+  });
+
+  it('returns a rebalance request from the latest optimistic tap state once the threshold is crossed', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const serverPriv = privKeyHex();
+    const borrowerPriv = privKeyHex();
+    const signerAddress = stxAddressFromPrivkey(serverPriv);
+    const borrowerAddress = stxAddressFromPrivkey(borrowerPriv);
+    const reservoirContractId = `${signerAddress}.sm-reservoir`;
+    const contractId = `${signerAddress}.sm-stackflow`;
+    const settings = new RuntimeSettingsStore(db, runtimeSettingsFromConfig({
+      messagePriceSats: '1000',
+      minFeeSats: '100',
+      maxPendingPerSender: 5,
+      maxPendingPerRecipient: 20,
+      maxDeferredPerSender: 5,
+      maxDeferredPerRecipient: 20,
+      maxDeferredGlobal: 200,
+      deferredMessageTtlMs: 86_400_000,
+      maxBorrowPerTap: '100000',
+      receiveCapacityMultiplier: 10,
+      rebalanceThresholdPct: 150,
+      refreshCapacityCooldownMs: 86_400_000,
+    }));
+    const service = new ReservoirService({
+      db,
+      settings,
+      serverAddress: reservoirContractId,
+      signerAddress,
+      reservoirContractId,
+      serverPrivateKey: serverPriv,
+      contractId,
+      chainId: 1,
+    });
+
+    const principals = canonicalPipePrincipals(borrowerAddress, reservoirContractId);
+    const pendingPipeId = pipeId(contractId, principals['principal-1'], principals['principal-2']);
+    const pipeKeyJson = JSON.stringify({
+      'principal-1': principals['principal-1'],
+      'principal-2': principals['principal-2'],
+      token: null,
+    });
+    db.prepare(`
+      INSERT INTO reservoir_pipes (
+        pipe_id, contract_id, pipe_key_json, server_balance, counterparty_balance, nonce, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, unixepoch('now') * 1000)
+    `).run(
+      pendingPipeId,
+      contractId,
+      pipeKeyJson,
+      '14000',
+      '20000',
+      '8',
+    );
+    db.prepare(`
+      INSERT INTO reservoir_pending_states (
+        pipe_id, nonce, contract_id, pipe_key_json, server_balance, counterparty_balance, action, actor, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch('now') * 1000)
+    `).run(
+      pendingPipeId,
+      '10',
+      contractId,
+      pipeKeyJson,
+      '16000',
+      '18000',
+      '1',
+      borrowerAddress,
+    );
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v2/info')) {
+        return { ok: true, json: async () => ({ burn_block_height: 999 }) } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({ okay: true, result: encodeSomePipe({
+          balance1: principals['principal-1'] === reservoirContractId ? 14000n : 20000n,
+          balance2: principals['principal-1'] === reservoirContractId ? 20000n : 14000n,
+          nonce: 8n,
+        }) }),
+      } as Response;
+    }) as unknown as typeof fetch);
+
+    const rebalance = await service.getTapRebalanceRequest(borrowerAddress);
+    expect(rebalance).toEqual({
+      token: null,
+      amount: '6000',
+      myBalance: '18000',
+      reservoirBalance: '10000',
+      nonce: '11',
+    });
+  });
+
+  it('accepts a rebalance withdraw signature from the latest optimistic tap state', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(':memory:');
+    const serverPriv = privKeyHex();
+    const borrowerPriv = privKeyHex();
+    const signerAddress = stxAddressFromPrivkey(serverPriv);
+    const borrowerAddress = stxAddressFromPrivkey(borrowerPriv);
+    const reservoirContractId = `${signerAddress}.sm-reservoir`;
+    const contractId = `${signerAddress}.sm-stackflow`;
+    const settings = new RuntimeSettingsStore(db, runtimeSettingsFromConfig({
+      messagePriceSats: '1000',
+      minFeeSats: '100',
+      maxPendingPerSender: 5,
+      maxPendingPerRecipient: 20,
+      maxDeferredPerSender: 5,
+      maxDeferredPerRecipient: 20,
+      maxDeferredGlobal: 200,
+      deferredMessageTtlMs: 86_400_000,
+      maxBorrowPerTap: '100000',
+      receiveCapacityMultiplier: 10,
+      rebalanceThresholdPct: 150,
+      refreshCapacityCooldownMs: 86_400_000,
+    }));
+    const service = new ReservoirService({
+      db,
+      settings,
+      serverAddress: reservoirContractId,
+      signerAddress,
+      reservoirContractId,
+      serverPrivateKey: serverPriv,
+      contractId,
+      chainId: 1,
+    });
+
+    const principals = canonicalPipePrincipals(borrowerAddress, reservoirContractId);
+    const pendingPipeId = pipeId(contractId, principals['principal-1'], principals['principal-2']);
+    const pipeKey = {
+      'principal-1': principals['principal-1'],
+      'principal-2': principals['principal-2'],
+      token: null,
+    };
+    db.prepare(`
+      INSERT INTO reservoir_pipes (
+        pipe_id, contract_id, pipe_key_json, server_balance, counterparty_balance, nonce, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, unixepoch('now') * 1000)
+    `).run(
+      pendingPipeId,
+      contractId,
+      JSON.stringify(pipeKey),
+      '14000',
+      '20000',
+      '8',
+    );
+    db.prepare(`
+      INSERT INTO reservoir_pending_states (
+        pipe_id, nonce, contract_id, pipe_key_json, server_balance, counterparty_balance, action, actor, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch('now') * 1000)
+    `).run(
+      pendingPipeId,
+      '10',
+      contractId,
+      JSON.stringify(pipeKey),
+      '16000',
+      '18000',
+      '1',
+      borrowerAddress,
+    );
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v2/info')) {
+        return { ok: true, json: async () => ({ burn_block_height: 999 }) } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({ okay: true, result: encodeSomePipe({
+          balance1: principals['principal-1'] === reservoirContractId ? 14000n : 20000n,
+          balance2: principals['principal-1'] === reservoirContractId ? 20000n : 14000n,
+          nonce: 8n,
+        }) }),
+      } as Response;
+    }) as unknown as typeof fetch);
+
+    const withdrawState: TransferState = {
+      pipeKey,
+      forPrincipal: borrowerAddress,
+      myBalance: '18000',
+      theirBalance: '10000',
+      nonce: '11',
+      action: '3',
+      actor: borrowerAddress,
+      hashedSecret: null,
+      validAfter: null,
+    };
+    const borrowerSig = await sip018Sign(contractId, buildTransferMessage(withdrawState), borrowerPriv, 1);
+
+    const result = await service.createWithdrawFundsParams({
+      user: borrowerAddress,
+      token: null,
+      amount: '6000',
+      myBalance: '18000',
+      reservoirBalance: '10000',
+      nonce: '11',
+      mySignature: borrowerSig,
+    });
+
+    expect(typeof result.reservoirSignature).toBe('string');
+
+    const latest = await service.getTrackedTapState(borrowerAddress);
+    expect(latest?.nonce).toBe('11');
+    expect(latest?.counterpartyBalance).toBe('18000');
     expect(latest?.serverBalance).toBe('10000');
   });
 
@@ -971,6 +1543,7 @@ describe('ReservoirService', () => {
       deferredMessageTtlMs: 86_400_000,
       maxBorrowPerTap: '100000',
       receiveCapacityMultiplier: 20,
+      rebalanceThresholdPct: 150,
       refreshCapacityCooldownMs: 86_400_000,
     }));
     const service = new ReservoirService({

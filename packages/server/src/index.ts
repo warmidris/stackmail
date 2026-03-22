@@ -280,6 +280,12 @@ async function main(): Promise<void> {
     chainId: config.chainId,
   });
 
+  setInterval(() => {
+    reservoir.sweepPendingRebalances().catch(err => {
+      console.warn('mailslot: rebalance sweep failed', err);
+    });
+  }, 60_000).unref();
+
   const server = createMailServer(config, store, reservoir, runtimeSettings);
 
   server.listen(config.port, config.host, () => {

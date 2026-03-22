@@ -27,6 +27,7 @@ const baseConfig: Config = {
   deferredMessageTtlMs: 86_400_000,
   maxBorrowPerTap: '100000',
   receiveCapacityMultiplier: 20,
+  rebalanceThresholdPct: 150,
   refreshCapacityCooldownMs: 86_400_000,
   inboxSessionTtlMs: 300_000,
   allowedOrigins: [],
@@ -45,12 +46,14 @@ describe('RuntimeSettingsStore', () => {
     const store = new RuntimeSettingsStore(db, runtimeSettingsFromConfig(baseConfig));
 
     expect(store.get().maxBorrowPerTap).toBe('100000');
+    expect(store.get().rebalanceThresholdPct).toBe(150);
     expect(store.get().refreshCapacityCooldownMs).toBe(86_400_000);
 
     const next = store.update({
       messagePriceSats: '2500',
       minFeeSats: '250',
       maxBorrowPerTap: '75000',
+      rebalanceThresholdPct: 175,
       refreshCapacityCooldownMs: 3_600_000,
       maxPendingPerSender: 7,
     });
@@ -58,9 +61,11 @@ describe('RuntimeSettingsStore', () => {
     expect(next.messagePriceSats).toBe('2500');
     expect(next.minFeeSats).toBe('250');
     expect(next.maxBorrowPerTap).toBe('75000');
+    expect(next.rebalanceThresholdPct).toBe(175);
     expect(next.refreshCapacityCooldownMs).toBe(3_600_000);
     expect(next.maxPendingPerSender).toBe(7);
     expect(store.get().maxBorrowPerTap).toBe('75000');
+    expect(store.get().rebalanceThresholdPct).toBe(175);
     expect(store.get().refreshCapacityCooldownMs).toBe(3_600_000);
   });
 });

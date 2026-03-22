@@ -225,6 +225,7 @@ async function printSendSignaturePreview(ctx, to, subject, body) {
   const status = ctx.status;
   const tap = ctx.tap ?? await getTapState(ctx.privateKey, ctx.serverUrl);
   if (!tap) throw new Error('No tap found for this sender. Open and fund a mailbox tap before sending.');
+  const capacity = getReceiveCapacitySummary(status, tap);
   const payInfo = await mailslot.getPaymentInfo(to, ctx.serverUrl);
   const price = BigInt(payInfo.amount);
   const fee = BigInt(status.minFeeSats ?? '0');
@@ -247,6 +248,12 @@ async function printSendSignaturePreview(ctx, to, subject, body) {
   printKv('Your balance', `${formatAmount(beforeMyBalance.toString(), token)} -> ${formatAmount(afterMyBalance.toString(), token)}`);
   printKv('Server balance', `${formatAmount(beforeServerBalance.toString(), token)} -> ${formatAmount(afterServerBalance.toString(), token)}`);
   printKv('Nonce', `${tap.pipeState.nonce.toString()} -> ${nextNonce.toString()}`);
+  if (capacity.aboveTarget) {
+    console.log('');
+    console.log(`Note: your tap is carrying ${capacity.excessReceiveLiquidity} extra ${token} of receive liquidity above the normal target.`);
+    console.log('If the server asks for a second signature, that signature is only used to return the extra receive liquidity to the reservoir.');
+    console.log('It does not change the message price, and it is separate from the payment signature for this message.');
+  }
   console.log('');
 }
 
@@ -258,7 +265,8 @@ function printRefreshSignaturePreview(ctx, capacity) {
   const nonceBefore = ctx.tap.pipeState.nonce;
   const nonceAfter = nonceBefore + 1n;
 
-  console.log('\nAbout to request a refresh-capacity signature:');
+  console.log('\nAbout to request a receive-capacity signature:');
+  console.log('This signature lets the reservoir lend more receive liquidity to your tap so incoming mail has room to land.');
   printKv('Refresh amount', formatAmount(capacity.refreshAmount.toString(), token));
   printKv('Your balance', formatAmount(beforeMyBalance.toString(), token));
   printKv('Receive capacity', `${formatAmount(beforeReservoirBalance.toString(), token)} -> ${formatAmount(afterReservoirBalance.toString(), token)}`);
@@ -274,6 +282,7 @@ async function confirmRefreshTransaction(ctx, capacity, action) {
   const reservoir = action.reservoirContract;
   const tokenLabel = action.token ?? 'STX';
   console.log('Transaction approval required:');
+  console.log('This on-chain step funds the receive side of your tap back up to the normal target.');
   printKv('Contract', `${action.reservoirContract}::borrow-liquidity`);
   printKv('You pay', formatAmount(fee.toString(), token));
   printKv('Reservoir sends', formatAmount(amount.toString(), token));
@@ -291,14 +300,20 @@ function getReceiveCapacitySummary(status, tap) {
   const messagePrice = policy.messagePrice > 0n ? policy.messagePrice : 1n;
   const remainingReceives = receiveLiquidity / messagePrice;
   const low = receiveLiquidity <= policy.lowReceiveThreshold;
+  const aboveTarget = receiveLiquidity > policy.receiveCapacityTarget;
   const refreshAmount = receiveLiquidity >= policy.receiveCapacityTarget
     ? 0n
     : policy.receiveCapacityTarget - receiveLiquidity;
+  const excessReceiveLiquidity = aboveTarget
+    ? receiveLiquidity - policy.receiveCapacityTarget
+    : 0n;
   return {
     ...policy,
     receiveLiquidity,
     remainingReceives,
     low,
+    aboveTarget,
+    excessReceiveLiquidity,
     refreshAmount,
   };
 }
@@ -616,6 +631,10 @@ async function printStatus(ctx) {
   console.log(`Messages receivable: about ${capacity.remainingReceives}`);
   if (capacity.low) {
     console.log(`Alert:              low receive capacity; run 'mailslot refresh-capacity'`);
+  }
+  if (capacity.aboveTarget) {
+    console.log(`Note:               ${formatAmount(capacity.excessReceiveLiquidity.toString(), token)} is above the normal receive target`);
+    console.log(`Why it matters:     the server may ask for one extra signature to return that excess liquidity to the reservoir`);
   }
   console.log(`Nonce:              ${ctx.tap.pipeState.nonce.toString()}`);
   console.log(`Tap source:         ${ctx.tap.source}`);
